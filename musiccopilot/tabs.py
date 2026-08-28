@@ -220,6 +220,11 @@ class TabLayout:
         window the notes were sliced from, or the grid and the printed bar
         numbers land on the wrong moment (see CLAUDE.md's "Grid columns")."""
         self.instrument, self.tempo, self.t0 = instrument, tempo, t0
+        # Kept so a consumer can pair a grid cell back with the note that made
+        # it (technique, pitch, timing) without recomputing the column maths -
+        # the web renderer draws the cells this layout placed rather than
+        # re-implementing `col_of` in JavaScript.
+        self.fretted = list(fretted)
         self.subdiv, self.beats_per_bar, self.first_bar = subdiv, beats_per_bar, first_bar
         self.labels = STRING_LABELS[instrument]
         self.n_str = len(self.labels)
@@ -390,6 +395,7 @@ class StaffLayout:
         self.subdiv, self.beats_per_bar, self.first_bar = subdiv, beats_per_bar, first_bar
         self.per_bar = beats_per_bar * subdiv
         notes = sorted(notes, key=lambda n: (n.start, n.pitch))
+        self.notes = notes          # see TabLayout.fretted
 
         slots = [_slot(n.pitch, self.clef) for n in notes]
         top_line = (N_STAFF_LINES - 1) * 2         # the staff's top line, in row-slots

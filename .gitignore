@@ -6,3 +6,7 @@ __pycache__/
 analyzed_songs/*
 .venv/*
 *.mp3
+# Scriptum (web front end)
+web/node_modules/
+web/dist/
+recordings/

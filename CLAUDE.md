@@ -33,6 +33,10 @@ python -m musiccopilot models                      # Gemini models this key can 
 python -m musiccopilot tab song.mp3 --part "guitar solo" --follow   # play along
 python -m musiccopilot tab song.mp3 --bars 97-112 --follow --minus-stem --count-in 4
 python -m musiccopilot record --instrument guitar  # play in: live notes/tab/chords
+
+python -m scriptum                                 # the web front end on :8420
+cd web && npm run build                            # required after any web/ change
+cd web && npm run dev                              # or Vite on :5173, API proxied
 ```
 
 `--follow` plays the passage and scrolls the tab under a cursor; `--minus-stem`
@@ -330,6 +334,77 @@ not worth having.
 
 The practical consequence: when comparing two transcriptions, expect ~10% of
 notes to differ by a frame. A change is only real if it moves more than that.
+
+### Scriptum: the web front end
+
+`scriptum/` (FastAPI) + `web/` (Vue 3 + Vite). Run it with `python -m scriptum`;
+the built client is served from `web/dist`, so **a front-end change needs
+`npm run build`** before it shows up on :8420 (or use `npm run dev` on :5173,
+which proxies the API across).
+
+The layer is deliberately thin, and the reasons it stays thin are worth keeping:
+
+- **No musical decision lives here.** `app._window` calls straight into
+  `cli._window`, and `_grid_cols` into `cli._grid_cols`, so a passage means the
+  same thing in the browser as on the command line — including `1:02` and
+  `bar17`. If those diverge, the browser and the terminal disagree about what
+  "bars 17-24" is, which is worse than either being wrong alone.
+- **Same cache, same ids.** A song's id is its file stem, which is also its
+  `analyzed_songs/<id>/` folder, so the CLI and the web app see each other's
+  work. `library.find` matches ids against file stems and never walks outside
+  the library root; `app._safe` keeps media requests inside one song's folder.
+- **`_song()` refuses instead of computing.** `cli._load` silently runs the
+  whole pipeline when the cache is cold, which is right for a terminal and
+  wrong for a request — the browser gets a 409 `not_analyzed` and an explicit
+  Analyse button rather than a five-minute hang.
+
+**The tab grid is computed in Python, drawn in JavaScript.**
+`serialize.layout_json` reads geometry off a `TabLayout`/`StaffLayout` —
+columns with their absolute time, bar number and chord, cells addressed by
+(row, column) — and `TabGrid.vue` only maps a column index to an x position.
+Do not reimplement `col_of` or the bar-grid maths in JS: it is load-bearing
+(see "Grid columns"), and a second copy silently drifts from the first. The
+layouts keep their source notes (`TabLayout.fretted`, `StaffLayout.notes`)
+purely so a cell can carry its technique and pitch without re-deriving them.
+Rows come out in *rendered* order (high string first), matching `line_rows`.
+
+The web renderer draws columns at a **uniform** width where the ASCII one sizes
+each to its widest cell. That is a deliberate divergence: on screen it makes
+the x axis proportional to time, so spacing reads as rhythm. `layout["text"]`
+still carries the exact ASCII rendering for copy/paste.
+
+**Play-along runs on one clock.** `useTransport` owns a single `<audio>`
+element and every visible tab reads its `currentTime`; several instruments can
+be on screen at once and must not drift apart. Position is sampled from the
+element on `requestAnimationFrame`, never from a `Date.now()` clock started
+next to it — the same reason `playalong.Transport` reads the audio callback's
+frame counter, and the same failure if you don't.
+
+**Slow work is a job, not a request** (`jobs.py`, progress over SSE from
+`/api/jobs/{id}/stream`). Analysis is minutes; the Gemini calls are tens of
+seconds and *highly variable* — the same 75-note cleanup measured 48s once and
+over 110s the next time on identical input. `clean_solo` and `suggest_solo`
+have no timeout of their own, so `Jobs.start` takes a `timeout` that is a
+**reporting deadline, not a kill**: Python cannot interrupt a thread blocked in
+a socket read, so the job is marked failed, the orphaned daemon thread is left
+to die with the process, and a late result is discarded rather than
+overwriting the reported failure. `SCRIPTUM_LLM_TIMEOUT` overrides the 300s
+default. One analysis per song at a time, or two runs race on the same cache.
+
+**Deep links need the SPA fallback.** `StaticFiles(html=True)` only serves
+`index.html` for a *directory*; every other miss is a 404, so reloading
+`/song/x/tabs` broke until `_SPAFiles` fell back to the shell. It deliberately
+does not do that for `/api` or `/ws`, so a mistyped endpoint still fails as an
+endpoint instead of quietly returning HTML.
+
+**The mic is the server's.** Both live panes open `record.Recorder` in the
+server process and stream frames over `/ws/live`, reusing `analysis_worker`
+unchanged — so the machine running Scriptum is the one in the practice room.
+The now-playing readout comes off the pitch contour, not the committed notes,
+because no committed note ever covers the present moment (see the recording
+notes above). `live.KeyTracker` recomputes the key on its own slower cadence
+for the same reason chords are rarer than pitch in `analysis_worker`:
+`detect_key` runs HPSS and costs far more than one analysis period.
 
 ### Musical constants
 

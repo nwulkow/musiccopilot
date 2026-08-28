@@ -127,6 +127,63 @@ or skip them entirely with `--part chorus2`.
   `python -m musiccopilot models` to see what your key can reach — if a Gemini 3
   id is listed, it is worth switching to for solo quality.
 
+## Scriptum — the web front end
+
+Everything above, in a browser. Dark, quiet, and built around the two things
+you actually do with a song: work out how it goes, and play along with it.
+
+```bash
+pip install -r requirements.txt      # now includes fastapi + uvicorn
+cd web && npm install && npm run build && cd ..
+export GEMINI_API_KEY=...            # optional: solos and tab cleanup
+python -m scriptum                   # → http://127.0.0.1:8420
+```
+
+`--host 0.0.0.0` makes it reachable from a phone or tablet on the same
+network; `--library ~/Music/band` points it at a different folder of songs.
+For front-end work, `cd web && npm run dev` runs Vite on :5173 and proxies the
+API to :8420, so both halves reload independently.
+
+What is in it:
+
+- **Library** — drag a song in; it uploads and starts analysing, with every
+  pipeline stage streamed to the page as it happens.
+- **Structure** — the arrangement drawn to scale, one block per part, with a
+  play button on each so you can hear a section without hunting for it. Open a
+  part for its bar-by-bar chords, the fingerings, and the words sung over it.
+- **Tabs & Notes** — any stem, any passage (a named part, `17-24`, or a time
+  range), as a real fretboard for guitar and bass and as a staff for anything
+  without strings. "Clean up" runs the Gemini pass from `--llm-clean`.
+- **Play along** — several instruments at once, scrolling under one cursor,
+  with speed, count-in, loop, and drop-your-instrument-out-of-the-mix.
+- **Lyrics**, **Chart** — the transcript grouped under its sections, and the
+  recreate sheet.
+- **Solo** — describe what you want and hear it over the real backing track.
+- **Live tab** — point the mic at the room and read what is being played. For
+  the practice room: what is the bass player doing?
+- **Live key** — the same, but it tells you the key and lights up the notes
+  that work on your neck, so you can join in.
+
+The mic for both live panes belongs to the **server**, so run Scriptum on the
+laptop that is in the room. The browser only draws what it is sent.
+
+### How it fits together
+
+`scriptum/` is a thin FastAPI layer; no musical decision is made in it. Window
+resolution goes through `cli._window`, so `bars 17-24` means the same thing in
+the browser as in the terminal, and the analysis cache is the same
+`analyzed_songs/<song>/` — a song analysed from the CLI opens in the browser
+already done, and vice versa.
+
+Tabs are drawn from a **grid the Python side computed**: `serialize.layout_json`
+reads columns, bar lines, chord positions and cells straight off `TabLayout` /
+`StaffLayout`, and the Vue component only maps a column index to an x
+position. The column maths is load-bearing (see CLAUDE.md's "Grid columns"),
+and a second copy of it in JavaScript would be a second copy to keep in step.
+
+Slow work runs as a job on a worker thread and reports progress over SSE, since
+`analyze` on a cold song is minutes and the Gemini calls are tens of seconds.
+
 ## Known limits
 
 - Chord detection is template-based: reliable for triads/sevenths, not for

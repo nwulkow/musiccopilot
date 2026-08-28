@@ -1,0 +1,238 @@
+/* Scriptum's visual language.
+ *
+ * Dark red, but not a red screen: a near-black ground with a warm red cast,
+ * so the accents read as ember and lacquer rather than alarm. Red carries
+ * identity and the current moment (the play cursor, the active part); a
+ * single brass/gold tone marks the things you act on musically - chords,
+ * keys, the notes you are being asked to play.
+ */
+
+:root {
+  /* ground */
+  --bg:            #0b0607;
+  --bg-deep:       #070405;
+  --surface:       #140c0e;
+  --surface-2:     #1c1114;
+  --surface-3:     #251619;
+  --surface-hi:    #2f1d21;
+
+  /* structure */
+  --line:          #352025;
+  --line-soft:     #26161a;
+  --line-strong:   #4a2a31;
+
+  /* red family */
+  --red-deep:      #4b0f1d;
+  --red:           #a8172f;
+  --red-bright:    #d32742;
+  --red-glow:      #ff456b;
+  --ember:         #ff6b4a;
+
+  /* brass - what you play */
+  --gold:          #d9a441;
+  --gold-soft:     #a8813a;
+  --gold-dim:      #6b5327;
+
+  /* type */
+  --text:          #f4e9ea;
+  --text-2:        #cbb4b8;
+  --text-3:        #9a8085;
+  --text-4:        #6d585c;
+
+  /* semantic */
+  --ok:            #4fb477;
+  --warn:          #e0a03a;
+  --err:           #e34c5c;
+
+  --vocal:         #d8607d;
+  --instrumental:  #c98a3e;
+
+  /* type stacks - a serif wordmark for a manuscript, a grotesque for the UI,
+     and a monospace with unambiguous digits for anything on a fret grid */
+  --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua",
+                  Georgia, "Times New Roman", serif;
+  --font-ui: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+             Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono",
+               "Fira Code", Menlo, Consolas, monospace;
+
+  /* geometry */
+  --r-sm: 5px;
+  --r: 9px;
+  --r-lg: 15px;
+  --sidebar: 232px;
+  --shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.4);
+  --glow-red: 0 0 18px rgba(211, 39, 66, 0.35);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #app { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* A slow radial wash keeps the ground from reading as flat black without
+   putting a texture behind the tab grids, which have to stay legible. */
+#app::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(1100px 620px at 12% -10%, rgba(168, 23, 47, 0.16), transparent 62%),
+    radial-gradient(820px 520px at 100% 6%, rgba(75, 15, 29, 0.3), transparent 60%);
+}
+
+h1, h2, h3, h4 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+p { margin: 0 0 0.75em; }
+a { color: var(--red-glow); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* --- scrollbars: present, but not part of the composition ---------------- */
+* { scrollbar-width: thin; scrollbar-color: var(--surface-hi) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--surface-hi);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background-color: var(--line-strong); }
+
+/* --- controls ------------------------------------------------------------ */
+button, input, select, textarea { font: inherit; color: inherit; }
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 7px 14px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.14s, border-color 0.14s, color 0.14s, transform 0.08s;
+}
+.btn:hover:not(:disabled) { background: var(--surface-3); border-color: var(--line-strong); color: var(--text); }
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: 0.42; cursor: not-allowed; }
+
+.btn-primary {
+  background: linear-gradient(180deg, var(--red-bright), var(--red));
+  border-color: #7d1128;
+  color: #fff;
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #e63a55, #b81a35);
+  border-color: var(--red-bright);
+  color: #fff;
+  box-shadow: var(--glow-red);
+}
+.btn-ghost { background: transparent; border-color: transparent; color: var(--text-3); }
+.btn-ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+.btn-sm { padding: 4px 9px; font-size: 12.5px; }
+.btn-icon { padding: 6px; width: 30px; height: 30px; }
+.btn.active { border-color: var(--red); color: var(--text); background: var(--surface-hi); }
+
+input[type="text"], input[type="search"], input[type="number"], select, textarea {
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color 0.14s, box-shadow 0.14s;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: var(--red);
+  box-shadow: 0 0 0 3px rgba(168, 23, 47, 0.16);
+}
+input::placeholder, textarea::placeholder { color: var(--text-4); }
+select { cursor: pointer; }
+select option { background: var(--surface-2); }
+
+input[type="range"] {
+  -webkit-appearance: none; appearance: none;
+  background: transparent; width: 100%; height: 18px; padding: 0; border: 0;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px; border-radius: 2px; background: var(--surface-hi);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--red-bright); border: 0; margin-top: -4.5px;
+  box-shadow: 0 0 0 3px rgba(211, 39, 66, 0.2);
+}
+input[type="range"]:focus { box-shadow: none; }
+
+/* --- surfaces ------------------------------------------------------------ */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r);
+  box-shadow: var(--shadow-sm);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.chip-red { border-color: var(--red-deep); background: rgba(168, 23, 47, 0.15); color: #f0a8b4; }
+.chip-gold { border-color: var(--gold-dim); background: rgba(217, 164, 65, 0.11); color: var(--gold); }
+
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.muted { color: var(--text-3); }
+.dim { color: var(--text-4); }
+
+/* A small-caps label above a group of controls or a stat. */
+.eyebrow {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--text-4);
+}
+
+.hr { height: 1px; background: var(--line-soft); border: 0; margin: 14px 0; }
+
+/* --- animation ----------------------------------------------------------- */
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.42; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+.spin { animation: spin 0.9s linear infinite; }
+.rise { animation: rise 0.22s ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -36,3 +36,9 @@ rich>=13.7
 
 # live play-along and recording (tab --follow, record)
 sounddevice>=0.5
+
+# Scriptum, the web front end (python -m scriptum). The client itself is in
+# web/ and is built with npm; these are only what serves it and the API.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
