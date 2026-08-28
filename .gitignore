@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+analyzed_songs/*
+.venv/*
+*.mp3

@@ -1,0 +1,129 @@
+# MusicCopilot
+
+Drop in an mp3 → get stems, chords, notes, lyrics, the song's form (verse,
+chorus, solo…) with an audio snippet per part, guitar/bass tabs, and
+Gemini-generated solos you can actually listen to. CLI only for now.
+
+## Install
+
+The ML deps (torch/demucs/basic-pitch) do **not** support Python 3.14 yet — use 3.11:
+
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+brew install ffmpeg            # librosa needs it for mp3
+export GEMINI_API_KEY=...      # your Gemini key
+```
+
+## Use
+
+```bash
+# one slow pass (stems + chords + notes + lyrics + form), cached per song
+python -m musiccopilot analyze song.mp3 --llm
+
+# the song's shape: what repeats, where, on which chords
+python -m musiccopilot parts song.mp3
+
+# the minimal sheet you need to play it: one chord loop per part, the
+# fingerings, what changes in each repeat, the words, tabs for the solos
+python -m musiccopilot chart song.mp3
+
+# everything the analysis found
+python -m musiccopilot show song.mp3
+python -m musiccopilot show song.mp3 --what chords
+
+# tab a part by name - no need to know which bars it is
+python -m musiccopilot tab song.mp3 --part "guitar solo" --stem guitar --play
+python -m musiccopilot tab song.mp3 --part chorus2 --stem bass
+
+# ...or by timestamp, or by bar
+python -m musiccopilot tab song.mp3 --stem guitar --start 1:02 --end 1:18 --audio --play
+python -m musiccopilot tab song.mp3 --stem guitar --bars 17-24
+
+# ask Gemini for a solo over the solo section, hear it over the real backing
+# track (the song minus the guitar stem)
+python -m musiccopilot solo song.mp3 --prompt "slow bluesy, lots of bends, build to a scream" --play
+python -m musiccopilot solo song.mp3 --prompt "fast legato, dorian" --part bridge --over chords
+```
+
+## What you get
+
+Everything lands in `analyzed_songs/<song>/`, next to the audio file:
+
+| file | what it is |
+|---|---|
+| `chart.md` | the recreate sheet - form, chord loops, fingerings, words, tabs |
+| `form.json` | the parts: role, bar range, timestamps, chord loop, key, variations |
+| `snippets/03_chorus-1.wav` | every part cut out as its own audio |
+| `snippets/03_chorus-1/guitar.wav` | ...per instrument, with `--stem-snippets` |
+| `analysis.json` | tempo, beats, key, chord track, raw segmentation |
+| `stems/*.wav` | drums, bass, other, vocals, guitar, piano |
+| `notes/*.json` | transcribed notes per stem |
+| `lyrics.json` | Whisper transcript of the vocal stem |
+
+Positions can be written three ways, so you can use whichever you have to hand:
+`--start 62` (seconds), `--start 1:02` (mm:ss), `--start bar17`, `--bars 17-24`,
+or skip them entirely with `--part chorus2`.
+
+## How it works
+
+| step | module | approach |
+|---|---|---|
+| stems | `audio.py` | Demucs `htdemucs_6s` → drums, bass, other, vocals, guitar, piano |
+| tempo/beats | `analysis.py` | librosa beat tracking + onset-energy downbeat phase |
+| key | `analysis.py` | Krumhansl–Kessler profile correlation |
+| chords | `analysis.py` | beat-synced CQT chroma → 97 templates → Viterbi smoothing |
+| form | `form.py` | recurrence-matrix spectral clustering, snapped to bars, named by pop convention |
+| structure | `analysis.py` | agglomerative segmentation + KMeans labelling (A/B/C) |
+| patterns | `analysis.py` | repeated n-chord loop mining, riff-density windows |
+| chart | `chart.py` | one chord loop per role, plus only what differs in each repeat |
+| notes | `notes.py` | Basic Pitch (polyphonic), pYIN fallback (mono) |
+| lyrics | `lyrics.py` | Whisper on the isolated vocal stem |
+| tabs | `tabs.py` | Viterbi over fret positions minimising hand travel |
+| solos | `gemini.py` | Gemini structured JSON output → notes → tab + MIDI + audio |
+| sound | `synth.py` | additive osc on a pitch curve (bends/slides/vibrato) + amp sim |
+
+## How the form is worked out
+
+`form.py` looks for the shape of a western pop/rock arrangement:
+
+1. **Repetition, not novelty.** A beat-synchronous recurrence matrix over CQT
+   chroma, balanced against a timbral path matrix, then spectral clustering of
+   its normalised Laplacian - so material that comes back gets the same label.
+2. **Snapped to bars.** Labels are majority-voted per bar and boundaries are
+   nudged onto the four-bar grid, because pop sections are multiples of four.
+3. **Consistent repeats.** Each occurrence of a block is trimmed back to the
+   bars that fit that block's chord loop, in that occurrence's own key. What is
+   left over is kept as a part in its own right - which is how a four-bar
+   pre-chorus, always glued to the verse by timbre alone, gets its own line.
+4. **Named by convention.** The chorus is the loud block that comes back with
+   the *same words*; the verse comes back early and often with *different*
+   words; a pre-chorus keeps handing over to the chorus; a bridge turns up late
+   and once. Instrumental blocks are read off position and note density, so a
+   busy one in the middle is a solo and a quiet one at the end is an outro.
+5. **Compared against each other.** Repeats are matched by cycling the loop and
+   transposing it, so a lifted last chorus reads as "same loop, a whole step
+   higher" instead of a different part.
+
+## Tuning the results
+
+- Form off? The knobs are in `FORM` in `config.py` - `min_bars`, `k_range`
+  (how many kinds of material to look for), `vocal_threshold`, `solo_density`.
+- Chords sound smeared? `detect_chords(..., self_prob=0.7)` for faster changes.
+- Tabs in the wrong position? adjust `_position_cost` / `_move_cost` in `tabs.py`.
+- Solo too tame? `--temperature 1.4`, or be far more specific in `--prompt`.
+- `GEMINI_MODEL=gemini-2.5-flash` for cheaper/faster solo drafts. Run
+  `python -m musiccopilot models` to see what your key can reach — if a Gemini 3
+  id is listed, it is worth switching to for solo quality.
+
+## Known limits
+
+- Chord detection is template-based: reliable for triads/sevenths, not for
+  dense jazz voicings or slash chords. Chart lines are a consensus over the
+  bars of a loop, so they survive the noise better than the raw chord track.
+- Part names are conventions, not ground truth. A song that does not follow
+  verse/chorus convention gets `Section A/B` names and honest chord loops.
+- Basic Pitch on a distorted guitar stem picks up harmonics as extra notes;
+  riff tabs need a human eye.
+- The synth is a stylised approximation, not a sampled guitar. Load the exported
+  `.mid` into a DAW with a real guitar VST if you want the good sound.
