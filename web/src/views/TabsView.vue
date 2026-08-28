@@ -1,8 +1,9 @@
 <script setup>
-import { inject, ref, computed, watch, onMounted } from 'vue'
+import { inject, ref, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, followJob, stemMeta } from '../api'
 import TabGrid from '../components/TabGrid.vue'
+import ScoreSheet from '../components/ScoreSheet.vue'
 
 const props = defineProps({ id: { type: String, required: true } })
 const song = inject('song')
@@ -21,17 +22,27 @@ const err = ref('')
 const cleaning = ref(false)
 const cleanInfo = ref(null)
 const cleanNote = ref('')
-const showAscii = ref(false)
+const view = ref(route.query.view || '')   // '' = the natural one for this stem
 
 const stems = computed(() => Object.keys(song.value?.note_stems || {}))
 const parts = computed(() => song.value?.form?.parts || [])
 const meta = computed(() => stemMeta(stem.value))
 
-/** The window currently on screen, in the shape both endpoints expect. */
+/** Tab where there is a fretboard, engraved notation where there is not. */
+const shown = computed(() => view.value || (meta.value.fretted ? 'grid' : 'sheet'))
+
+/**
+ * The window currently on screen, in the shape both endpoints expect.
+ *
+ * "Whole song" says so explicitly, because `cli._window` reads an unbounded
+ * request as the first twenty seconds - the right default for a terminal
+ * printing a tab, and a passage that silently stops after twenty seconds here.
+ */
 function windowParams() {
   const p = { stem: stem.value, subdiv: subdiv.value }
   if (partName.value) p.part = partName.value
   else if (bars.value) p.bars = bars.value
+  else { p.start = 0; p.end = song.value?.analysis?.duration ?? 0 }
   return p
 }
 
@@ -40,7 +51,8 @@ async function load() {
   err.value = ''
   cleanInfo.value = null
   try {
-    layout.value = await api.tab(props.id, windowParams())
+    const fetcher = shown.value === 'sheet' ? api.score : api.tab
+    layout.value = await fetcher(props.id, windowParams())
   } catch (e) {
     err.value = e.detail?.error === 'no_notes'
       ? `No notes transcribed for ${stem.value}.`
@@ -75,24 +87,33 @@ function llmClean() {
 }
 
 /** Keep the URL describing what is on screen, so a passage can be linked to. */
-watch([stem, partName, bars], () => {
+watch([stem, partName, bars, view], () => {
   router.replace({ query: {
     stem: stem.value,
     ...(partName.value ? { part: partName.value } : {}),
     ...(bars.value && !partName.value ? { bars: bars.value } : {}),
+    ...(view.value ? { view: view.value } : {}),
   } })
   load()
 })
 watch(subdiv, () => load())
+// The song is what the first load waits for - the whole-song window needs its
+// duration - so this is the only place it is kicked off, not `onMounted` too.
+watch(() => song.value?.analysis, (a) => { if (a) load() }, { immediate: true })
 
 function pickPart(p) {
   partName.value = partName.value === p.name ? '' : p.name
   bars.value = ''
 }
 
-onMounted(load)
 
 const noteCount = computed(() => layout.value?.notes?.length || 0)
+const kindLabel = computed(() => {
+  const l = layout.value
+  if (!l) return ''
+  if (l.kind === 'score') return `${l.clefs.join(' + ')} · ${l.key}`
+  return l.kind === 'tab' ? `${l.instrument} tab` : `${l.clef} staff`
+})
 </script>
 
 <template>
@@ -168,7 +189,7 @@ const noteCount = computed(() => layout.value?.notes?.length || 0)
           <div>
             <h3 class="sh" :style="{ '--c': meta.color }">
               {{ meta.label }}
-              <span class="dim thin">· {{ layout.kind === 'tab' ? layout.instrument + ' tab' : layout.clef + ' staff' }}</span>
+              <span class="dim thin">· {{ kindLabel }}</span>
             </h3>
             <div class="dim mono tiny">{{ layout.heading }} · {{ noteCount }} notes</div>
           </div>
@@ -179,14 +200,26 @@ const noteCount = computed(() => layout.value?.notes?.length || 0)
             </span>
             <button
               class="btn btn-sm"
-              :disabled="cleaning || !health.gemini"
+              :disabled="cleaning || !health.gemini || shown === 'sheet'"
               :title="health.gemini ? 'Ask Gemini to merge jittered notes and drop noise' : 'Set GEMINI_API_KEY to use this'"
               @click="llmClean"
             >{{ cleaning ? 'Cleaning…' : 'Clean up' }}</button>
             <span v-if="cleanNote" class="dim tiny mono">{{ cleanNote }}</span>
-            <button class="btn btn-sm btn-ghost" @click="showAscii = !showAscii">
-              {{ showAscii ? 'Grid' : 'Plain text' }}
-            </button>
+            <div class="seg">
+              <button
+                v-if="meta.fretted"
+                class="btn btn-sm" :class="{ active: shown === 'grid' }"
+                @click="view = 'grid'"
+              >Tab</button>
+              <button
+                class="btn btn-sm" :class="{ active: shown === 'sheet' }"
+                @click="view = 'sheet'"
+              >Sheet</button>
+              <button
+                class="btn btn-sm" :class="{ active: shown === 'text' }"
+                @click="view = 'text'"
+              >Plain text</button>
+            </div>
             <RouterLink
               class="btn btn-sm"
               :to="{ name: 'play', params: { id }, query: { part: partName, stems: stem } }"
@@ -194,7 +227,10 @@ const noteCount = computed(() => layout.value?.notes?.length || 0)
           </div>
         </header>
 
-        <pre v-if="showAscii" class="ascii mono">{{ layout.text }}</pre>
+        <ScoreSheet
+          v-if="shown === 'sheet'" :score="layout" :scale="Math.min(1.8, Math.max(0.65, zoom / 18))"
+        />
+        <pre v-else-if="shown === 'text'" class="ascii mono">{{ layout.text }}</pre>
         <TabGrid v-else :layout="layout" :col-width="zoom" />
       </div>
 
@@ -226,6 +262,7 @@ const noteCount = computed(() => layout.value?.notes?.length || 0)
 .sh { font-family: var(--font-display); font-size: 18px; color: var(--c); }
 .thin { font-weight: 400; font-size: 12px; }
 .sacts { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.seg { display: flex; gap: 3px; }
 
 .ascii {
   margin: 0;

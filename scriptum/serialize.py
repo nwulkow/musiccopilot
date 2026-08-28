@@ -207,3 +207,55 @@ def layout_json(layout, *, title: str = "", stem: str = "",
         "columns": _columns(layout, cells),
         "text": layout.render(),
     }
+
+
+# --- engraved notation ------------------------------------------------------
+
+def _score_note(n) -> dict:
+    """One written event. A rest is a note with no keys, which is how the
+    renderer tells them apart - same as `ScoreNote` itself."""
+    return {
+        "keys": n.keys,
+        "duration": n.duration,
+        "dots": n.dots,
+        "start": round(n.start, 4),
+        "end": round(n.end, 4),
+        "tie": n.tie,
+        "pitches": n.pitches,
+    }
+
+
+def score_json(score, *, title: str = "", stem: str = "",
+               start: float = 0.0, end: float = 0.0) -> dict:
+    """A `score.Score` as engravable JSON.
+
+    The counterpart to `layout_json` for stems that deserve real notation
+    rather than a grid. The same division of labour applies, one level up:
+    every musical decision - hands, note values, spelling, where the rests
+    go - was made in `musiccopilot.score`, and the client only turns that
+    into glyphs. It cannot decide, say, that a note is an eighth; by the time
+    it sees one, it already is.
+    """
+    return {
+        "kind": "score",
+        "stem": stem,
+        "title": title,
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "clefs": score.clefs,
+        "key": score.key,
+        "sig": score.sig,
+        "time": score.time,
+        "tempo": round(score.tempo, 2),
+        "t0": round(score.t0, 4),
+        "subdiv": score.subdiv,
+        "beats_per_bar": score.beats_per_bar,
+        "first_bar": score.first_bar,
+        "measures": [{
+            "number": m.number,
+            "start": round(m.start, 4),
+            "end": round(m.end, 4),
+            "chord": m.chord,
+            "voices": [[_score_note(n) for n in v] for v in m.voices],
+        } for m in score.measures],
+    }

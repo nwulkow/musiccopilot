@@ -64,6 +64,7 @@ export const api = {
   chart: (id) => req(`/api/songs/${encodeURIComponent(id)}/chart`),
   chords: (id) => req(`/api/songs/${encodeURIComponent(id)}/chords`),
   tab: (id, params) => req(`/api/songs/${encodeURIComponent(id)}/tab${qs(params)}`),
+  score: (id, params) => req(`/api/songs/${encodeURIComponent(id)}/score${qs(params)}`),
   cleanTab: (id, body) => req(`/api/songs/${encodeURIComponent(id)}/tab/clean`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

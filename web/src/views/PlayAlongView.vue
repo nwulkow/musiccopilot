@@ -11,6 +11,7 @@ import { inject, ref, computed, watch, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { api, stemMeta, mmss } from '../api'
 import TabGrid from '../components/TabGrid.vue'
+import ScoreSheet from '../components/ScoreSheet.vue'
 import { useTransport } from '../composables/useTransport'
 
 const props = defineProps({ id: { type: String, required: true } })
@@ -20,11 +21,12 @@ const route = useRoute()
 const transport = useTransport()
 const partName = ref(route.query.part || '')
 const picked = ref((route.query.stems || 'guitar').split(',').filter(Boolean))
-const views = ref({})            // stem -> 'tab' | 'notes'
-const layouts = ref({})          // stem -> layout json
+const views = ref({})            // stem -> 'tab' | 'sheet' | 'notes'
+const layouts = ref({})          // stem -> tab layout or score, per its view
 const loading = ref(false)
 const minusMine = ref([])        // stems dropped from the bed, so you play them
 const zoom = ref(16)
+const detail = ref(4)      // grid steps per beat: how fine the rhythm is read
 const err = ref('')
 
 const stems = computed(() => Object.keys(song.value?.note_stems || {}))
@@ -35,21 +37,54 @@ const part = computed(() => parts.value.find((p) => p.name === partName.value) |
 const region = computed(() =>
   part.value ? { start: part.value.start, end: part.value.end } : null)
 
-/** A stem with no fretboard cannot show frets; it gets a staff either way. */
-const viewOf = (s) => (stemMeta(s).fretted ? (views.value[s] || 'tab') : 'staff')
+/** Sheet music is scaled off the same slider that sets the tab's column width,
+ *  so one "zoom" control means one thing on screen whatever is being read. */
+const sheetScale = computed(() => Math.min(1.8, Math.max(0.65, zoom.value / 17)))
+
+/** A stem with no fretboard has no frets to show; it reads as sheet music. */
+const viewOf = (s) => views.value[s] || (stemMeta(s).fretted ? 'tab' : 'sheet')
+
+/**
+ * The passage every sheet is laid out for.
+ *
+ * With no part chosen this is the *whole song*, spelled out as an explicit
+ * start and end. It has to be: `cli._window` defaults an unbounded request to
+ * the first twenty seconds, which is the right default for a terminal that
+ * would otherwise print a four-minute tab and the wrong one here - it is why
+ * the play-along used to stop dead twenty seconds in, with the cursor running
+ * off the end of a grid that had nothing left to show.
+ */
+function windowParams(stem) {
+  const p = { stem, subdiv: detail.value }
+  if (partName.value) p.part = partName.value
+  else { p.start = 0; p.end = analysis.value?.duration ?? 0 }
+  return p
+}
+
+/** Fetch one stem's sheet. Which endpoint depends on how it is being read:
+ *  engraved notation is a different thing from a grid, not a skin on one. */
+async function loadStem(s) {
+  const fetcher = viewOf(s) === 'sheet' ? api.score : api.tab
+  try { return await fetcher(props.id, windowParams(s)) } catch { return null }
+}
 
 async function loadLayouts() {
   loading.value = true
   err.value = ''
   try {
-    const out = {}
-    await Promise.all(picked.value.map(async (s) => {
-      const params = { stem: s, subdiv: 4 }
-      if (partName.value) params.part = partName.value
-      try { out[s] = await api.tab(props.id, params) } catch { out[s] = null }
-    }))
-    layouts.value = out
+    const got = await Promise.all(picked.value.map(loadStem))
+    layouts.value = Object.fromEntries(picked.value.map((s, i) => [s, got[i]]))
   } catch (e) { err.value = e.message } finally { loading.value = false }
+}
+
+/** Switching one stem's view only re-fetches that stem. */
+async function setView(s, v) {
+  if (viewOf(s) === v) return
+  const before = viewOf(s)
+  views.value = { ...views.value, [s]: v }
+  if ((before === 'sheet') !== (v === 'sheet')) {
+    layouts.value = { ...layouts.value, [s]: await loadStem(s) }
+  }
 }
 
 /** Load the bed: the mix, or the mix minus whatever you are playing. */
@@ -73,11 +108,21 @@ function toggleMinus(s) {
 }
 
 watch(picked, loadLayouts, { deep: true })
+watch(detail, loadLayouts)
 watch(partName, () => { loadLayouts(); loadAudio() })
 watch(minusMine, () => loadAudio(), { deep: true })
-watch(analysis, (a) => { if (a) transport.tempo.value = a.tempo }, { immediate: true })
+// The song is what the first load waits for: the whole-song window needs its
+// duration, and that arrives with the song rather than with the route. This is
+// the *only* place the first load is kicked off - loading again from
+// `onMounted` as well would land a second copy of every layout after the user
+// had already scrolled or seeked, and snap all of it back to the start.
+watch(analysis, (a) => {
+  if (!a) return
+  transport.tempo.value = a.tempo
+  loadLayouts()
+}, { immediate: true })
 
-onMounted(() => { loadLayouts(); loadAudio() })
+onMounted(loadAudio)
 
 const pos = computed(() => transport.time.value)
 const barNow = computed(() => {
@@ -180,6 +225,15 @@ const barNow = computed(() => {
       </div>
 
       <div class="pgroup">
+        <span class="eyebrow">Rhythm</span>
+        <select v-model.number="detail" class="detail">
+          <option :value="2">8ths</option>
+          <option :value="4">16ths</option>
+          <option :value="8">32nds</option>
+        </select>
+      </div>
+
+      <div class="pgroup">
         <span class="eyebrow">Zoom</span>
         <input v-model.number="zoom" type="range" min="9" max="34" class="zoom" />
       </div>
@@ -199,22 +253,35 @@ const barNow = computed(() => {
           <h3 class="sh">{{ stemMeta(s).label }}</h3>
           <div class="sright">
             <span v-if="minusMine.includes(s)" class="chip chip-red">muted — your part</span>
-            <div v-if="stemMeta(s).fretted" class="seg">
+            <div class="seg">
               <button
+                v-if="stemMeta(s).fretted"
                 class="btn btn-sm" :class="{ active: viewOf(s) === 'tab' }"
-                @click="views[s] = 'tab'"
+                @click="setView(s, 'tab')"
               >Tab</button>
               <button
+                class="btn btn-sm" :class="{ active: viewOf(s) === 'sheet' }"
+                @click="setView(s, 'sheet')"
+              >Sheet</button>
+              <button
                 class="btn btn-sm" :class="{ active: viewOf(s) === 'notes' }"
-                @click="views[s] = 'notes'"
+                @click="setView(s, 'notes')"
               >Notes</button>
             </div>
-            <span v-else class="chip">staff</span>
           </div>
         </header>
 
+        <ScoreSheet
+          v-if="layouts[s] && viewOf(s) === 'sheet'"
+          :score="layouts[s]"
+          :cursor-time="pos"
+          :scale="sheetScale"
+          follow
+          @seek="transport.seek($event)"
+        />
+
         <TabGrid
-          v-if="layouts[s] && viewOf(s) !== 'notes'"
+          v-else-if="layouts[s] && viewOf(s) !== 'notes'"
           :layout="layouts[s]"
           :cursor-time="pos"
           :col-width="zoom"
@@ -280,6 +347,7 @@ const barNow = computed(() => {
 .row { display: flex; flex-wrap: wrap; gap: 5px; }
 .stembtn.active { border-color: var(--c); background: color-mix(in srgb, var(--c) 20%, var(--surface-2)); color: var(--text); }
 .zoom { width: 110px; }
+.detail { width: auto; padding: 4px 8px; font-size: 12.5px; }
 
 .sheets { display: flex; flex-direction: column; gap: 11px; }
 .sheet { padding: 12px 15px 8px; border-left: 3px solid var(--c); }

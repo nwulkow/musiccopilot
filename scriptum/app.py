@@ -303,6 +303,40 @@ def create_app() -> FastAPI:
         return _tab_payload(_song(song_id), song_id, stem, part, bars, start,
                             end, subdiv)
 
+    # ------------------------------------------------------------------ score
+    @app.get("/api/songs/{song_id}/score")
+    def get_score(song_id: str, stem: str = "piano", part: str | None = None,
+                  bars: str | None = None, start: str | None = None,
+                  end: str | None = None, subdiv: int = 4) -> dict:
+        """A passage as engraved notation rather than a grid.
+
+        Same window vocabulary as `/tab` (it goes through the same
+        `cli._window`), and the same rule about where decisions live: this
+        only calls `score.build_score` and serialises what comes back. The
+        client engraves it; it does not decide any of it.
+        """
+        song = _song(song_id)
+        ns = song.notes.get(stem)
+        if not ns:
+            raise HTTPException(404, {"error": "no_notes", "stem": stem,
+                                      "have": sorted(song.notes)})
+        from musiccopilot.score import build_score
+
+        a = song.analysis
+        t_start, t_end, title = _window(song, part, bars, start, end)
+        window = nt.in_window(ns, t_start, t_end)
+        built = build_score(
+            window, tempo=a.tempo, t0=t_start, beats_per_bar=a.beats_per_bar,
+            subdiv=subdiv, first_bar=report.bar_number(song, t_start),
+            key=a.key, chords=[c for c in a.chords if c.end > t_start and c.start < t_end],
+            min_cols=cli._grid_cols(song, t_start, t_end, a, subdiv))
+        out = serialize.score_json(built, title=title, stem=stem,
+                                   start=t_start, end=t_end)
+        out["heading"] = report.window_title(song, t_start, t_end,
+                                             f"{title} · " if title else "")
+        out["notes"] = [serialize.note_json(n) for n in window]
+        return out
+
     @app.post("/api/songs/{song_id}/tab/clean")
     def clean_tab(song_id: str, body: dict = Body(default={})) -> dict:
         """Ask Gemini to declutter a transcribed passage, as a job.

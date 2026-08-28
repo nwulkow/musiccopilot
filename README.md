@@ -42,7 +42,7 @@ python -m musiccopilot tab song.mp3 --stem guitar --bars 17-24
 
 # piano (or vocals, or anything else with no fretboard) prints as a text
 # staff instead of a fretboard - clef is picked automatically from the notes
-python -m musiccopilot tab song.mp3 --stem piano --bars 17-24
+python -m musiccopilot tab song.mp3 --stem piano --bars 17-24   # staff, not frets
 
 # play along: the passage plays while the tab scrolls under a live cursor.
 # --minus-stem drops your instrument out of the mix so you play that part,
@@ -151,11 +151,15 @@ What is in it:
 - **Structure** — the arrangement drawn to scale, one block per part, with a
   play button on each so you can hear a section without hunting for it. Open a
   part for its bar-by-bar chords, the fingerings, and the words sung over it.
-- **Tabs & Notes** — any stem, any passage (a named part, `17-24`, or a time
-  range), as a real fretboard for guitar and bass and as a staff for anything
-  without strings. "Clean up" runs the Gemini pass from `--llm-clean`.
-- **Play along** — several instruments at once, scrolling under one cursor,
-  with speed, count-in, loop, and drop-your-instrument-out-of-the-mix.
+- **Tabs & Notes** — any stem, any passage (a named part, `17-24`, a time
+  range, or the whole song), as a real fretboard for guitar and bass and as
+  engraved sheet music for anything without strings: grand staff, key
+  signature, beams, rests, ties, chord symbols. Guitar and bass can be read
+  either way. "Clean up" runs the Gemini pass from `--llm-clean`.
+- **Play along** — several instruments at once, tabs and sheet music side by
+  side, scrolling under one cursor, with speed, count-in, loop, and
+  drop-your-instrument-out-of-the-mix. Drag the progress bar and every part
+  jumps to that moment.
 - **Lyrics**, **Chart** — the transcript grouped under its sections, and the
   recreate sheet.
 - **Solo** — describe what you want and hear it over the real backing track.
@@ -174,6 +178,12 @@ resolution goes through `cli._window`, so `bars 17-24` means the same thing in
 the browser as in the terminal, and the analysis cache is the same
 `analyzed_songs/<song>/` — a song analysed from the CLI opens in the browser
 already done, and vice versa.
+
+Sheet music follows the same rule one level up. `musiccopilot/score.py` decides
+the music — which hand a note is on, what value it is written as, how it is
+spelled against the key, where the rests fall — and the browser only engraves
+what it is handed. Nothing in JavaScript may decide that a note is an eighth;
+by the time it gets there, it already is one.
 
 Tabs are drawn from a **grid the Python side computed**: `serialize.layout_json`
 reads columns, bar lines, chord positions and cells straight off `TabLayout` /

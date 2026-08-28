@@ -35,6 +35,7 @@ python -m musiccopilot tab song.mp3 --bars 97-112 --follow --minus-stem --count-
 python -m musiccopilot record --instrument guitar  # play in: live notes/tab/chords
 
 python -m scriptum                                 # the web front end on :8420
+cd web && npm install                              # vue, vue-router, vexflow
 cd web && npm run build                            # required after any web/ change
 cd web && npm run dev                              # or Vite on :5173, API proxied
 ```
@@ -309,6 +310,61 @@ scrolling note-name ruler), and `_follow` overrides `--follow-view tab` to
 `notes` with a warning rather than crashing on a `StaffLayout` passed to
 `follow_tab`.
 
+### Engraved notation is a second renderer, not a better staff
+
+[score.py](musiccopilot/score.py) turns notes into *written* music — bars of
+note values with rests, ties, accidentals, a key signature and one or two
+clefs — and the browser engraves it with VexFlow (`ScoreSheet.vue`). It does
+not replace `tabs.StaffLayout`: that is a time-proportional grid the terminal
+can print and `--follow` can put a cursor on, and it stays the CLI's renderer.
+The score is what a reader expects to see, and it only exists on the web.
+
+The division of labour is the tab grid's rule one level up. Every *musical*
+decision is Python's — which hand a note is on, what value it is written as,
+how it is spelled, where the rests fall — and the client only draws glyphs.
+So the pieces worth knowing:
+
+- **The column grid is the tab's grid.** `col_of` is copied from `TabLayout`
+  verbatim, so a score and a tab of the same passage agree about where bar 17
+  is. `subdiv` is the rhythmic resolution the notation is read at; the web UI
+  exposes it as "Rhythm" because 16ths off a noisy transcription are a wall of
+  ties and 8ths are readable.
+- **Gaps under an eighth are not rests** (`_events`). A note released a
+  sixteenth early is a finger lifting, not a rest, and writing it as one turns
+  every bar into note-rest-note-rest confetti that reads nothing like what was
+  played.
+- **Notes and rests obey different alignment rules** (`_fits`, `value_for`).
+  A quarter or shorter goes wherever it lands — an eighth on the second
+  sixteenth of a beat is ordinary rhythm — but a half note may not start on
+  beat 2 and hide where beat 3 is. Rests are stricter still (undotted, aligned
+  to their own length), because showing where the beat is *is* a rest's job.
+  Being loose about short values is what stops late onsets shattering a bar
+  into tied fragments; being strict about long ones is what keeps the bar
+  readable.
+- **Spelling comes from the key signature** (`spell`). Candidates are ranked
+  by: the signature's own spelling first (it needs no printed accidental),
+  then fewest accidentals, then the direction the key points. That is why C
+  major writes C# where B♭ major writes D♭, and why E major writes F natural
+  rather than E#. `_MAJOR_SIG`/`_MINOR_SIG` also re-spell the key itself —
+  `detect_key` only ever names sharps, so without them a song in B♭ would be
+  engraved with ten sharps. *Which* accidentals actually print is VexFlow's
+  call (`Accidental.applyAccidentals`, per stave): that is a convention about
+  the bar, not a fact about the note.
+- **A grand staff is earned** (`_split_hands`). Two staves need notes on both
+  sides of middle C *and* a range no one hand covers; otherwise a bass line
+  gets an empty treble stave above it, which is harder to read than the single
+  stave it should have had.
+
+On the drawing side, `ScoreSheet.vue` packs measures into systems in two
+passes — ask each bar how narrow it can be (`preCalculateMinTotalWidth`), fill
+a line, hand the slack back in proportion — and measures each system's own
+vertical reach. Two things there are load-bearing: `new Stave(x, y, w)` puts
+the top of VexFlow's *reserved band* at `y`, not the top staff line
+(`STAVE_HEAD` measures that band once and subtracts it), and the reach is
+computed **per system**, because one high note at the top of the page would
+otherwise buy that much headroom for every line — and a chord symbol stranded
+eighty pixels above its own bar reads as the previous system's chord.
+
 ### Transcription is not bit-reproducible, and why it is close
 
 Re-transcribing the same audio does **not** give byte-identical notes: torch's
@@ -367,6 +423,38 @@ Do not reimplement `col_of` or the bar-grid maths in JS: it is load-bearing
 layouts keep their source notes (`TabLayout.fretted`, `StaffLayout.notes`)
 purely so a cell can carry its technique and pitch without re-deriving them.
 Rows come out in *rendered* order (high string first), matching `line_rows`.
+
+`/api/songs/{id}/score` is the same arrangement for engraved notation
+(`serialize.score_json` over `musiccopilot.score`, drawn by `ScoreSheet.vue`);
+it takes the same window vocabulary because it goes through the same
+`cli._window`. The client picks the endpoint from how the stem is being read —
+a fretless stem defaults to `Sheet`, a fretted one to `Tab` — and both
+payloads carry `notes`, so the `Notes` ruler works off either.
+
+**"Whole song" has to say so.** `cli._window` reads a request with no part,
+bars, start or end as *the first twenty seconds* — right for a terminal that
+would otherwise print a four-minute tab, wrong for a browser. Both
+`PlayAlongView.windowParams` and `TabsView.windowParams` therefore send an
+explicit `start=0` and `end=duration` when no passage is chosen. Without it the
+play-along stops dead twenty seconds in, with the cursor running off the end of
+a grid that has nothing left to show. That window also arrives with the song
+rather than the route, so both views re-load once `analysis` lands.
+
+**A long tab is virtualised; a long score is not.** A whole song at sixteenths
+is ~2000 columns, and with several instruments on screen the cursor's per-frame
+class updates touched more nodes than a frame has time for — so `TabGrid` puts
+only the columns near the viewport in the DOM. `ScoreSheet` does not need it:
+engraving all 132 bars of `crystallize` takes ~180ms and the cursor is a
+sibling overlay, not a class on every glyph. (If a page ever *seems* to take
+fifteen seconds to draw a score, check what `networkidle` is waiting for — the
+mix mp3 is minutes long.)
+
+**Following a seek is not the same as following playback.** Both `TabGrid` and
+`ScoreSheet` scroll instantly for a long jump and glide for a short one.
+`TabGrid` also tracks the scroll it asked for (`aiming`): a smooth `scrollTo`
+does not move `scrollLeft` until it lands, so re-issuing it every frame — as
+the first version did — cancels and restarts the animation forever, and the tab
+creeps or stops.
 
 The web renderer draws columns at a **uniform** width where the ASCII one sizes
 each to its widest cell. That is a deliberate divergence: on screen it makes

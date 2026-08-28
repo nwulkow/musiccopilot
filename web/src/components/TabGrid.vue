@@ -13,8 +13,15 @@
  * (it sizes each column to its widest cell). On screen that is an
  * improvement: uniform columns make the x axis proportional to time, so
  * spacing reads as rhythm.
+ *
+ * Only the columns near the viewport are put in the DOM. A whole song at
+ * sixteenth resolution is a couple of thousand columns, and with three or
+ * four instruments on screen the cursor's per-frame class updates were
+ * touching more nodes than a frame has time for - which reads to the player
+ * as a tab that has stopped moving. The window is the scroll position, so it
+ * costs nothing to keep up to date.
  */
-import { computed, ref, watch, nextTick } from 'vue'
+import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue'
 
 const props = defineProps({
   layout: { type: Object, required: true },
@@ -28,6 +35,8 @@ const props = defineProps({
 const emit = defineEmits(['seek'])
 
 const scroller = ref(null)
+const scrollX = ref(0)
+const viewW = ref(0)
 
 const rowH = computed(() => (props.compact ? 17 : 21))
 const gutter = 30
@@ -38,9 +47,25 @@ const isStaff = computed(() => props.layout?.kind === 'staff')
 const width = computed(() => gutter + cols.value.length * props.colWidth)
 const bodyH = computed(() => rows.value.length * rowH.value)
 
+/** The columns worth putting in the DOM: what is on screen, plus a margin so
+ *  a scroll never outruns the render. */
+const window_ = computed(() => {
+  const w = props.colWidth
+  const pad = Math.ceil(viewW.value / w) || 40
+  const lo = Math.max(0, Math.floor((scrollX.value - gutter) / w) - pad)
+  const hi = Math.min(cols.value.length,
+                      Math.ceil((scrollX.value + viewW.value - gutter) / w) + pad)
+  return [lo, Math.max(lo, hi)]
+})
+
+const shown = computed(() => {
+  const [lo, hi] = window_.value
+  return cols.value.slice(lo, hi)
+})
+
 /** Bar lines, taken from the columns the layout marked as bar starts. */
 const barLines = computed(() =>
-  cols.value.filter((c) => c.bar_start).map((c) => ({
+  shown.value.filter((c) => c.bar_start).map((c) => ({
     x: gutter + c.i * props.colWidth,
     bar: c.bar,
     i: c.i,
@@ -49,16 +74,16 @@ const barLines = computed(() =>
 
 /** Chord changes, at the column the layout put them on. */
 const chordMarks = computed(() =>
-  cols.value.filter((c) => c.chord).map((c) => ({
+  shown.value.filter((c) => c.chord).map((c) => ({
     x: gutter + c.i * props.colWidth,
     name: c.chord,
   })),
 )
 
-/** Every cell, flattened with its screen position. */
+/** Every on-screen cell, flattened with its screen position. */
 const cells = computed(() => {
   const out = []
-  for (const c of cols.value) {
+  for (const c of shown.value) {
     for (const cell of c.cells) {
       out.push({
         ...cell,
@@ -93,17 +118,57 @@ const activeKeys = computed(() => {
   return new Set(cells.value.filter((c) => c.start <= t && t < c.end).map((c) => c.key))
 })
 
-// Keep the cursor on screen while playing, scrolling in steps rather than
-// continuously so the tab does not slide under the eye on every frame.
-watch(cursorX, async (x) => {
+// Keep the cursor on screen, scrolling in steps rather than continuously so
+// the tab does not slide under the eye on every frame.
+//
+// `aiming` is what makes that work. A smooth `scrollTo` takes a few hundred
+// milliseconds, and `scrollLeft` does not move to the target until it lands -
+// so re-issuing the scroll on the next frame, as the naive version did,
+// cancels the animation and starts it again, every frame, for as long as the
+// cursor is out of the band. The tab then creeps or stops altogether, which
+// is exactly what it looks like when the play-along "does not go forward".
+let aiming = null
+watch(cursorX, (x) => {
   if (!props.follow || x == null || !scroller.value) return
-  await nextTick()
   const box = scroller.value
   const left = box.scrollLeft
   const w = box.clientWidth
-  if (x < left + w * 0.15 || x > left + w * 0.7) {
-    box.scrollTo({ left: Math.max(0, x - w * 0.3), behavior: 'smooth' })
-  }
+  if (!w) return
+  if (x >= left + w * 0.15 && x <= left + w * 0.7) return
+  const target = Math.max(0, Math.min(width.value - w, x - w * 0.3))
+  if (aiming != null && Math.abs(aiming - target) < w * 0.2) return
+  aiming = target
+  // A seek can land anywhere in the song; playback only ever creeps. Gliding
+  // across a whole song's worth of tab would take longer than the passage
+  // does, so a long jump is instant and a short one glides.
+  box.scrollTo({ left: target, behavior: Math.abs(target - left) > w * 1.5 ? 'auto' : 'smooth' })
+})
+
+function onScroll() {
+  const box = scroller.value
+  if (!box) return
+  scrollX.value = box.scrollLeft
+  if (aiming != null && Math.abs(box.scrollLeft - aiming) < 4) aiming = null
+}
+
+let ro = null
+onMounted(() => {
+  const box = scroller.value
+  if (!box) return
+  viewW.value = box.clientWidth
+  ro = new ResizeObserver(([e]) => { viewW.value = e.contentRect.width })
+  ro.observe(box)
+})
+onBeforeUnmount(() => ro && ro.disconnect())
+
+// A new passage starts at its own beginning, not wherever the last one was
+// left scrolled to. Keyed on the window rather than on the object, because a
+// re-fetch of the *same* passage is not a new one - snapping back to bar one
+// every time a layout is reloaded undoes whatever the player just seeked to.
+watch(() => `${props.layout?.stem}:${props.layout?.start}:${props.layout?.end}`, () => {
+  aiming = null
+  if (scroller.value) scroller.value.scrollLeft = 0
+  scrollX.value = 0
 })
 
 function onClick(e) {
@@ -127,7 +192,7 @@ function cellClass(cell) {
 
 <template>
   <div class="tabgrid" :class="{ staff: isStaff }">
-    <div ref="scroller" class="scroll" @click="onClick">
+    <div ref="scroller" class="scroll" @click="onClick" @scroll.passive="onScroll">
       <div class="canvas" :style="{ width: width + 'px' }">
 
         <!-- chord row -->
