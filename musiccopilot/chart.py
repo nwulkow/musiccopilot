@@ -11,8 +11,9 @@ import re
 from pathlib import Path
 
 from . import notes as nt
+from .config import TUNINGS
 from .form import parse_chord, reference_part, transpose_loop
-from .tabs import chord_shape, pick_instrument, tab_for
+from .tabs import StaffLayout, chord_shape, pick_instrument, tab_for
 
 SEMITONE_WORDS = {1: "a half step", 2: "a whole step", 3: "three half steps",
                   4: "two whole steps", 5: "a fourth", 7: "a fifth"}
@@ -68,15 +69,20 @@ def _tab_of(song, part, max_bars: int, subdiv: int = 4) -> str:
     window = nt.in_window(ns, part.start, end)
     if not window:
         return ""
-    instrument = "bass" if stem == "bass" else "guitar" if stem == "guitar" else pick_instrument(window)
-    body = tab_for(window, instrument, tempo=a.tempo, t0=part.start,
-                   beats_per_bar=a.beats_per_bar, subdiv=subdiv, max_width=84,
-                   first_bar=part.bar,
-                   chords=[c for c in a.chords if c.end > part.start and c.start < end])
     where = (f"bars {part.bar}-{part.bar + max_bars - 1}" if end < part.end
              else f"bars {part.bar}-{part.bar + part.bars - 1}")
-    source = stem if stem == instrument else f"{stem} stem, on {instrument}"
-    return f"**Tab** ({source}, {where}):\n\n```\n{body}\n```\n"
+    chords = [c for c in a.chords if c.end > part.start and c.start < end]
+    if stem in TUNINGS or stem == "guitar":
+        instrument = "bass" if stem == "bass" else "guitar" if stem == "guitar" else pick_instrument(window)
+        body = tab_for(window, instrument, tempo=a.tempo, t0=part.start,
+                       beats_per_bar=a.beats_per_bar, subdiv=subdiv, max_width=84,
+                       first_bar=part.bar, chords=chords)
+        source = stem if stem == instrument else f"{stem} stem, on {instrument}"
+        return f"**Tab** ({source}, {where}):\n\n```\n{body}\n```\n"
+    # no fretboard for this stem (piano, vocals, demucs' "other") - a staff instead
+    body = StaffLayout(window, tempo=a.tempo, t0=part.start, beats_per_bar=a.beats_per_bar,
+                       subdiv=subdiv, max_width=84, first_bar=part.bar, chords=chords).render()
+    return f"**Staff** ({stem}, {where}):\n\n```\n{body}\n```\n"
 
 
 def build(song, tabs: str = "instrumental", max_tab_bars: int = 8) -> str:

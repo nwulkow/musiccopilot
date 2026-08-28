@@ -40,6 +40,17 @@ python -m musiccopilot tab song.mp3 --part chorus2 --stem bass
 python -m musiccopilot tab song.mp3 --stem guitar --start 1:02 --end 1:18 --audio --play
 python -m musiccopilot tab song.mp3 --stem guitar --bars 17-24
 
+# piano (or vocals, or anything else with no fretboard) prints as a text
+# staff instead of a fretboard - clef is picked automatically from the notes
+python -m musiccopilot tab song.mp3 --stem piano --bars 17-24
+
+# play along: the passage plays while the tab scrolls under a live cursor.
+# --minus-stem drops your instrument out of the mix so you play that part,
+# --speed slows playback down without changing pitch, --count-in clicks you in
+python -m musiccopilot tab song.mp3 --part "guitar solo" --stem guitar --follow
+python -m musiccopilot tab song.mp3 --stem guitar --bars 17-24 \
+    --follow --minus-stem --speed 0.75 --count-in 4
+
 # ask Gemini for a solo over the solo section, hear it over the real backing
 # track (the song minus the guitar stem)
 python -m musiccopilot solo song.mp3 --prompt "slow bluesy, lots of bends, build to a scream" --play

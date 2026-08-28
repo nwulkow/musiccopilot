@@ -47,6 +47,43 @@ class Solo(BaseModel):
     notes: list[SoloNote]
 
 
+CLEAN_SYSTEM = """You are a session guitarist cleaning up a machine transcription of a
+recorded solo. The note list you are given was produced by an automatic pitch
+tracker and is NOT a performance to preserve exactly - it is evidence of one,
+and it has known failure modes:
+- Pitch jitter chops one held or bent note into several short adjacent notes
+  at nearly the same pitch. Merge these into the single note a player actually
+  fretted, choosing the technique (bend/slide/hammer/pull/vibrato) that best
+  explains the pitch movement across the fragments.
+- The tracker occasionally fires a spurious grace note a semitone or two off
+  right before or after a real note (background noise, string noise, bleed
+  from another instrument). Drop these; they are not something a guitarist
+  played on purpose.
+- Extremely short notes (under ~1/16 of a beat) that do not connect two real
+  pitches are almost always noise, not a fast lick - remove them unless the
+  surrounding notes clearly form a fast, deliberate run.
+- Octave errors (a note an octave away from its neighbours with otherwise
+  identical timing) should be corrected to the octave that fits the phrase.
+
+What you must NOT do: do not compose a new solo, do not add notes that were
+not there in some form, do not "improve" the phrasing beyond removing
+artifacts, and do not change the overall contour or rhythm of the line. The
+result should sound like the same recorded performance, just transcribed the
+way a competent human transcriber would have written it - fewer, cleaner
+notes, real techniques instead of pitch staircases. If a note already looks
+clean, pass it through unchanged.
+
+Timing units match the input: `beat` is beats from the start of the window
+given to you (0.0 = its downbeat)."""
+
+
+class CleanedSolo(BaseModel):
+    """Structured response from `clean_solo` - a decluttered version of the input notes."""
+
+    changes: str = Field(description="1-3 sentences on what was merged, dropped, or fixed")
+    notes: list[SoloNote]
+
+
 def _client():
     """Build a genai Client, importing google.genai lazily (see CLAUDE.md's lazy-imports note)."""
     from google import genai
@@ -57,8 +94,16 @@ def _client():
 
 
 def _config(**kw):
-    """Thin wrapper around `types.GenerateContentConfig` so callers don't import google.genai."""
+    """Thin wrapper around `types.GenerateContentConfig` so callers don't import google.genai.
+
+    Explicitly disables automatic function calling: nothing here passes `tools`,
+    but leaving AFC on its default makes `generate_content` log a one-time
+    "use Chat.send_message instead" warning on every process regardless, since
+    the SDK checks the AFC config before it checks whether any tools exist.
+    """
     from google.genai import types
+    kw.setdefault("automatic_function_calling",
+                  types.AutomaticFunctionCallingConfig(disable=True))
     return types.GenerateContentConfig(**kw)
 
 
@@ -88,7 +133,12 @@ def suggest_solo(prompt: str, analysis, start: float, end: float,
         f"What the player asked for: {prompt}\n\n"
         f"Fill roughly the whole section. Return JSON only."
     )
-    resp = _client().models.generate_content(
+    # Bind the client instead of chaining off `_client()` directly: an unnamed
+    # client can be garbage-collected mid-request (tenacity retries reuse its
+    # httpx client across attempts), which surfaces as a misleading "client
+    # has been closed" error instead of the real one.
+    client = _client()
+    resp = client.models.generate_content(
         model=model, contents=contents,
         config=_config(system_instruction=SOLO_SYSTEM, temperature=temperature,
                        response_mime_type="application/json", response_schema=Solo),
@@ -111,6 +161,52 @@ def solo_to_notes(solo: Solo, tempo: float, t0: float = 0.0) -> list[Note]:
             bend=float(n.bend_semitones),
         ))
     return out
+
+
+def notes_to_solonotes(notes: list[Note], tempo: float, t0: float = 0.0) -> list[SoloNote]:
+    """Inverse of `solo_to_notes`: absolute-time `Note`s -> beat-relative units,
+    so a transcribed window can be handed to Gemini in the same shape it writes."""
+    bps = tempo / 60.0
+    return [
+        SoloNote(
+            beat=(n.start - t0) * bps,
+            duration=max(0.05, n.duration) * bps,
+            midi=n.pitch,
+            technique=n.technique if n.technique in TECHNIQUES.__args__ else "normal",
+            bend_semitones=float(n.bend),
+            velocity=float(min(1.0, max(0.2, n.velocity))),
+        )
+        for n in sorted(notes, key=lambda n: n.start)
+    ]
+
+
+def clean_solo(notes: list[Note], analysis, start: float, end: float,
+              model: str = GEMINI_MODEL, temperature: float = 0.2) -> CleanedSolo:
+    """Ask Gemini to declutter a transcribed note window into a realistic tab.
+
+    Machine transcription over-segments: pitch jitter on a held or bent note
+    becomes several near-duplicate notes, and the noise floor left behind by
+    stem separation fires spurious grace notes. This asks the model to merge
+    and prune those artifacts back into what a guitarist actually played,
+    without composing anything new - see `CLEAN_SYSTEM`. Low temperature by
+    default: this is cleanup, not composition, so it should be the least
+    surprising pass over the data that still fixes the obvious mess.
+    """
+    solo_notes = notes_to_solonotes(notes, analysis.tempo, t0=start)
+    contents = (
+        f"Clean up this transcribed solo.\n\n"
+        f"Musical context:\n{section_context(analysis, start, end)}\n\n"
+        f"Transcribed notes (machine output, {len(solo_notes)} notes):\n"
+        f"{json.dumps([n.model_dump() for n in solo_notes], indent=2)}\n\n"
+        f"Return the cleaned note list as JSON only."
+    )
+    client = _client()
+    resp = client.models.generate_content(
+        model=model, contents=contents,
+        config=_config(system_instruction=CLEAN_SYSTEM, temperature=temperature,
+                       response_mime_type="application/json", response_schema=CleanedSolo),
+    )
+    return resp.parsed if resp.parsed else CleanedSolo.model_validate_json(resp.text)
 
 
 def listening_notes(audio_path: str | Path, analysis, model: str = GEMINI_MODEL) -> str:

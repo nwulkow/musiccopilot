@@ -10,7 +10,7 @@ OUTDIR = "analyzed_songs"       # per-song folder lives here, next to the audio
 LEGACY_WORKDIR = ".musiccopilot"    # what OUTDIR used to be called
 
 # --- Gemini -----------------------------------------------------------------
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_KEY_ENV = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 # --- pitch / notes ----------------------------------------------------------

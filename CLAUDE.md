@@ -25,6 +25,7 @@ python -m musiccopilot chart song.mp3              # the recreate sheet (also ->
 python -m musiccopilot show song.mp3 --what chords # read the cache
 python -m musiccopilot tab song.mp3 --part "guitar solo" --stem guitar --play
 python -m musiccopilot tab song.mp3 --stem guitar --start 1:02 --end 1:18 --audio
+python -m musiccopilot tab song.mp3 --part "guitar solo" --stem guitar --llm-clean
 python -m musiccopilot snippets song.mp3 --stems   # re-cut the per-part wavs
 python -m musiccopilot solo song.mp3 --prompt "slow bluesy" --play
 python -m musiccopilot models                      # Gemini models this key can reach
@@ -38,6 +39,13 @@ python -m musiccopilot record --instrument guitar  # play in: live notes/tab/cho
 drops your instrument out of the mix so you play that part, `--speed 0.5` slows
 it down without dropping the pitch, and `--follow-view notes` swaps the
 fretboard for note names (for stems where frets would be a lie).
+
+`--llm-clean` sends the transcribed window to Gemini (`gemini.clean_solo`) to
+merge pitch-jitter fragments, correct octave errors and drop spurious
+noise-floor notes before the tab is rendered. It is a display-time pass over
+whatever `--part`/`--bars`/`--start`/`--end` selected - it never writes
+`notes/<stem>.json`, so a bad cleanup costs nothing but re-running without
+the flag.
 
 There is no test suite, linter config, or build step. To smoke-test a change, run against
 the checked-in `crystallize.mp3` — its stems, notes, lyrics and analysis are already in
@@ -276,6 +284,27 @@ contour started: `_cell` prints `fret + round(bend)`, so a bend measured off a
 different origin renders as `7b7`, a bend to the note you are already on.
 `_cell` also refuses a target at or below the fret, in case that ever recurs.
 
+### Stems without a fretboard get a staff, not a fret lie
+
+`TUNINGS` only has `guitar` and `bass`. `cmd_tab` and `chart._tab_of` both
+check `stem in TUNINGS` (or `== "guitar"`) before calling `fret_notes` —
+anything else (`piano`, `vocals`, `other`, and whatever a solo's `lead` stem
+turns out to be) renders through `tabs.StaffLayout`/`render_staff` instead: a
+text staff, one clef auto-picked per window by `pick_clef` (median pitch vs.
+middle C, the same idea as `pick_instrument`), sized to the notes actually in
+the window plus `LEDGER_PAD` rows, not a fixed grand-staff span — a full
+treble+bass ladder is mostly empty rows for a part that lives in one clef.
+`StaffLayout` mirrors `TabLayout`'s column/bar-grid math (`col_of`/`time_of`,
+`per_line` wrapping) exactly, so a caller that lays out a tab can lay out a
+staff the same way; only the row axis differs (staff line/space slot instead
+of string). Before this, `--stem piano` silently fell through `pick_instrument`
+and printed a 4-string bass fretboard for a piano part — fixing that is why
+the check exists, not just the new renderer. `--follow` has no live cursor for
+a staff yet; following a fretless stem always uses `--follow-view notes` (a
+scrolling note-name ruler), and `_follow` overrides `--follow-view tab` to
+`notes` with a warning rather than crashing on a `StaffLayout` passed to
+`follow_tab`.
+
 ### Transcription is not bit-reproducible, and why it is close
 
 Re-transcribing the same audio does **not** give byte-identical notes: torch's
@@ -313,5 +342,29 @@ or tunings elsewhere.
 
 [gemini.py](musiccopilot/gemini.py) uses structured output — the pydantic `Solo` schema is passed
 as `response_schema`, so prompt changes must keep the schema satisfiable. Model comes from
-`GEMINI_MODEL` (default `gemini-2.5-pro`); `listening_notes` uploads the mp3 via the Files API.
+`GEMINI_MODEL` (default `gemini-3.5-flash`); `listening_notes` uploads the mp3 via the Files API.
 `cli.main` seeds `np.random.seed(0)`, which also makes the synth's reverb impulse deterministic.
+`python -m musiccopilot models` lists what a given key can actually reach — `models.list()`
+can still list a model your key can no longer call (`generate_content` 404s with "no longer
+available to new users"), so a listing is not proof a model works; only a real call is.
+
+Always bind `genai.Client(...)` to a name before calling into it (every `gemini._client()`
+caller does this). An unnamed temporary can be garbage-collected mid-request — tenacity's
+retry loop and paginated calls like `models.list()` both reuse the client's httpx transport
+across multiple round trips — and the GC'd client's `__del__` closes that transport out from
+under the in-flight call. The failure then surfaces as `RuntimeError: Cannot send a request,
+as the client has been closed`, which hides whatever the real error was (wrong model name,
+bad key, quota).
+
+`_config()` disables automatic function calling by default (`AutomaticFunctionCallingConfig
+(disable=True)`) — nothing here passes `tools`, but the SDK checks the AFC config before it
+checks whether any tools exist, so leaving it on its default logs a "use Chat.send_message
+instead" warning on every process regardless.
+
+`clean_solo` (`tab --llm-clean`, wired through `cli._llm_clean`) declutters a transcribed
+note window rather than composing one: it reuses the `Solo`/`SoloNote` schema and
+`solo_to_notes` unit conversion, but with a system prompt (`CLEAN_SYSTEM`) that explicitly
+forbids inventing notes or changing the phrase's contour — only merging pitch-jitter
+fragments, dropping noise-floor grace notes, and fixing octave errors. It runs at
+`temperature=0.2` (cleanup, not composition) and is display-time only: it never writes
+`notes/<stem>.json`, so a bad cleanup is one flag away from the raw transcription.

@@ -286,9 +286,10 @@ def live_view(rec: Recorder, state: LiveState, stop: threading.Event, *,
     from rich.text import Text
 
     from . import report
-    from .config import pitch_name
-    from .tabs import TabLayout, fret_notes
+    from .config import TUNINGS, pitch_name
+    from .tabs import StaffLayout, TabLayout, fret_notes
     console = console or report.console
+    fretted = instrument in TUNINGS
 
     def meter(level: float, width: int = 28) -> Text:
         """A bar-graph level meter; sqrt-scaled so quiet input still moves it."""
@@ -314,12 +315,15 @@ def live_view(rec: Recorder, state: LiveState, stop: threading.Event, *,
         body = Text()
         bpm = tempo or state.tempo or 120.0
         if view == "tab" and recent:
+            # `instrument` may have no fretboard (piano, vocals, other) - a
+            # staff instead of a KeyError from `fret_notes`' tuning lookup.
             t0 = max(0.0, now - history)
-            lay = TabLayout(fret_notes(recent, instrument), instrument,
-                            tempo=bpm, t0=t0, beats_per_bar=beats_per_bar,
-                            subdiv=subdiv, first_bar=1,
-                            max_width=max(40, console.width - 8),
-                            chords=[c for c in chords if c.end > t0])
+            common = dict(tempo=bpm, t0=t0, beats_per_bar=beats_per_bar,
+                          subdiv=subdiv, first_bar=1,
+                          max_width=max(40, console.width - 8),
+                          chords=[c for c in chords if c.end > t0])
+            lay = (TabLayout(fret_notes(recent, instrument), instrument, **common)
+                   if fretted else StaffLayout(recent, **common))
             for line in range(lay.n_lines):
                 for row in lay.line_rows(line):
                     body.append(row + "\n")

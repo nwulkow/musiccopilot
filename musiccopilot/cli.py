@@ -26,10 +26,10 @@ from pathlib import Path
 import numpy as np
 
 from . import chart, notes as nt, report, synth
-from .config import SR
+from .config import SR, TUNINGS
 from .form import bar_edges, bar_start
 from .pipeline import Song
-from .tabs import TabLayout, fret_notes, pick_instrument, render_tab
+from .tabs import StaffLayout, TabLayout, fret_notes, pick_instrument, render_tab
 
 _BAR = re.compile(r"^(?:bars?\s*(\d+)|(\d+)\s*bars?)$")
 
@@ -158,6 +158,25 @@ def cmd_show(args) -> None:
      "instruments": report.instruments, "lyrics": report.lyrics}[args.what](song)
 
 
+def _llm_clean(song, window: list, start: float, end: float) -> list:
+    """Run `gemini.clean_solo` over a transcribed note window and report the
+    before/after note count and what the model says it changed.
+
+    This never touches the cache: it is a display-time pass, applied fresh
+    each time `--llm-clean` is given, so a bad cleanup is one flag away from
+    the raw transcription and never overwrites `notes/<stem>.json`.
+    """
+    from .gemini import clean_solo, solo_to_notes
+
+    if not window:
+        return window
+    before = len(window)
+    cleaned = clean_solo(window, song.analysis, start, end)
+    out = solo_to_notes(cleaned, song.analysis.tempo, t0=start)
+    report.console.print(f"[dim]llm-clean: {before} → {len(out)} notes — {cleaned.changes}[/]")
+    return out
+
+
 def cmd_tab(args) -> None:
     """Print (or play/follow) tablature for a part, a bar range or a time range."""
     song = _load(args.file)
@@ -169,11 +188,17 @@ def cmd_tab(args) -> None:
         return
     start, end, title = _window(args, song)
     window = nt.in_window(ns, start, end)
+    if args.llm_clean:
+        window = _llm_clean(song, window, start, end)
+    # A fretboard is a lie for a stem with no strings (piano, vocals, the
+    # demucs catch-all "other"): `pick_instrument` would have quietly forced
+    # bass or guitar tuning on it (`--stem piano` used to print a 4-string
+    # bass fretboard for a piano part). Those stems get a text staff instead.
+    fretted_stem = args.stem in TUNINGS or args.stem == "guitar"
     instrument = ("bass" if args.stem == "bass" else
                   "guitar" if args.stem == "guitar" else pick_instrument(window))
-    layout = TabLayout(
-        fret_notes(window, instrument), instrument, tempo=a.tempo, t0=start,
-        beats_per_bar=a.beats_per_bar, subdiv=args.subdiv,
+    common = dict(
+        tempo=a.tempo, t0=start, beats_per_bar=a.beats_per_bar, subdiv=args.subdiv,
         first_bar=report.bar_number(song, start),
         chords=[c for c in a.chords if c.end > start and c.start < end],
         # The passage may end on a rest; the grid still has to reach the end of
@@ -182,9 +207,17 @@ def cmd_tab(args) -> None:
         # boundary sits a little past its last bar line, and the arithmetic
         # version turns that overhang into a whole extra empty bar.
         min_cols=_grid_cols(song, start, end, a, args.subdiv))
+    if fretted_stem:
+        layout = TabLayout(fret_notes(window, instrument), instrument, **common)
+    else:
+        layout = StaffLayout(window, **common)
     heading = report.window_title(song, start, end,
                                   f"{title} · " if title else "") + f" · {args.stem}"
     if args.follow:
+        if not fretted_stem and args.follow_view == "tab":
+            report.console.print(f"[yellow]'{args.stem}' has no fretboard; "
+                                 f"following with --follow-view notes instead[/]")
+            args.follow_view = "notes"
         return _follow(args, song, window, layout, start, end, heading)
     report.console.print(report.Panel(layout.render(), expand=False, title=heading))
 
@@ -382,16 +415,26 @@ def cmd_record(args) -> None:
         json.dumps(nt.to_dicts(ns)))
     nt.write_midi(ns, out / "take.mid", tempo)
 
-    instrument = "bass" if args.instrument == "bass" else "guitar"
-    # fit the terminal: a tab wider than the console gets wrapped by the panel,
-    # which interleaves the strings and makes it unreadable
-    tab = render_tab(fret_notes(ns, instrument), instrument, tempo=tempo, t0=0.0,
-                     subdiv=args.subdiv, chords=chords,
-                     max_width=max(40, report.console.width - 6))
+    # A fretboard is a lie for an instrument with no strings (piano and
+    # anything else outside `TUNINGS`) - a staff instead, same as `tab`/`record`'s
+    # live view. Fit the terminal either way: a tab/staff wider than the
+    # console gets wrapped by the panel, which interleaves the rows and makes
+    # it unreadable.
+    max_width = max(40, report.console.width - 6)
+    if args.instrument in TUNINGS:
+        instrument = args.instrument
+        tab = render_tab(fret_notes(ns, instrument), instrument, tempo=tempo, t0=0.0,
+                         subdiv=args.subdiv, chords=chords, max_width=max_width)
+        heading = "## tab"
+    else:
+        from .tabs import StaffLayout
+        tab = StaffLayout(ns, tempo=tempo, t0=0.0, subdiv=args.subdiv,
+                          chords=chords, max_width=max_width).render()
+        heading = "## staff"
     lines = [f"# {name}", "", f"{len(ns)} notes · {rec.seconds:.1f}s · {tempo:.0f} bpm", ""]
     if chords:
         lines += ["## chords", "", "  " + " ".join(c.name for c in chords), ""]
-    lines += ["## tab", "", "```", tab, "```", ""]
+    lines += [heading, "", "```", tab, "```", ""]
     (out / "chart.md").write_text("\n".join(lines))
 
     report.console.print(report.Panel(tab, expand=False,
@@ -410,7 +453,12 @@ def cmd_models(args) -> None:
     from google import genai
 
     from .config import GEMINI_MODEL, gemini_api_key
-    for m in genai.Client(api_key=gemini_api_key()).models.list():
+    # Bind the client: an unnamed `genai.Client(...)` can be garbage-collected
+    # mid-pagination, closing its httpx client before `.list()` fetches the
+    # next page and surfacing as "client has been closed" instead of any real
+    # error.
+    client = genai.Client(api_key=gemini_api_key())
+    for m in client.models.list():
         if "generateContent" in (getattr(m, "supported_actions", None) or []):
             mark = " [green]← current[/]" if m.name.endswith(GEMINI_MODEL) else ""
             report.console.print(f"{m.name}{mark}")
@@ -473,6 +521,9 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--start", default=None, help="seconds, mm:ss, or bar N")
     t.add_argument("--end", default=None, help="seconds, mm:ss, or bar N")
     t.add_argument("--subdiv", type=int, default=4, help="grid steps per beat")
+    t.add_argument("--llm-clean", action="store_true",
+                   help="ask Gemini to declutter the transcription (merge jittered/"
+                        "duplicate notes, drop spurious ones) before rendering the tab")
     t.add_argument("--audio", action="store_true", help="also synthesise the passage")
     t.add_argument("--play", action="store_true",
                    help="play the part's recording, or the synthesised tab with --audio")

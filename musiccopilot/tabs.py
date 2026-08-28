@@ -331,6 +331,188 @@ def render_tab(fretted: list[Fretted], instrument: str = "guitar", **kw) -> str:
     return TabLayout(fretted, instrument, **kw).render()
 
 
+# --- staff notation (for stems a fretboard would misrepresent) -------------
+
+# Line/space slot for each natural, counted up from a clef's bottom line
+# (slot 0). Accidentals sit on their natural's slot - a text staff has no
+# room to shift a sharp sideways, so `_spelling` prints the accidental in
+# the note's name instead of moving the head.
+_NATURAL_SLOT = {"C": 0, "D": 1, "E": 2, "F": 3, "G": 4, "A": 5, "B": 6}
+_MIDDLE_C = 60          # C4
+CLEFS = {"treble": 64, "bass": 43}     # bottom line: E4, G2
+N_STAFF_LINES = 5
+
+
+def pick_clef(notes: list[Note]) -> str:
+    """Treble or bass, judged the same way `pick_instrument` picks guitar or
+    bass: by where the notes actually sit, against middle C."""
+    if not notes:
+        return "treble"
+    return "bass" if float(np.median([n.pitch for n in notes])) < _MIDDLE_C else "treble"
+
+
+def _slot(pitch: int, clef: str) -> int:
+    """Line/space slot on `clef`, 0 at that clef's bottom line, rising one
+    per natural letter name (so an octave is 7 slots, not 12 semitones)."""
+    bottom = CLEFS[clef]
+    letter, octave = NOTE_NAMES[pitch % 12][0], pitch // 12 - 1
+    ref_letter, ref_octave = NOTE_NAMES[bottom % 12][0], bottom // 12 - 1
+    return (octave - ref_octave) * 7 + (_NATURAL_SLOT[letter] - _NATURAL_SLOT[ref_letter])
+
+
+def _spelling(pitch: int) -> str:
+    """Note name without octave, e.g. 'C#', for printing at a staff position."""
+    return NOTE_NAMES[pitch % 12]
+
+
+class StaffLayout:
+    """A text staff: one clef, sized to the notes actually in the window
+    (plus a couple of ledger rows either side), not a fixed grand-staff span.
+
+    Piano (and anything else without a `TUNINGS` entry) has no fretboard to
+    place notes on, so this is the `--stem piano` counterpart to `TabLayout`:
+    same beat-subdivided column grid and bar wrapping (`col_of`/`time_of` are
+    identical), but each row is a staff line/space instead of a string, and a
+    note is a letter name sitting in its slot rather than a fret number.
+    Clef is picked once per window (`pick_clef`), the way guitar/bass tuning
+    is picked once per window today - a part doesn't change hands mid-phrase.
+    """
+
+    LEDGER_PAD = 2   # rows of ledger space kept above/below the outermost note
+
+    def __init__(self, notes: list[Note], *, clef: str | None = None,
+                 tempo: float = 120.0, t0: float = 0.0, beats_per_bar: int = 4,
+                 subdiv: int = 4, max_width: int = 92, first_bar: int = 1,
+                 chords: list | None = None, min_cols: int = 0):
+        self.instrument = "staff"   # so callers that branch on TabLayout.instrument (e.g. bass synth voice) still work
+        self.clef = clef or pick_clef(notes)
+        self.tempo, self.t0 = tempo, t0
+        self.subdiv, self.beats_per_bar, self.first_bar = subdiv, beats_per_bar, first_bar
+        self.per_bar = beats_per_bar * subdiv
+        notes = sorted(notes, key=lambda n: (n.start, n.pitch))
+
+        slots = [_slot(n.pitch, self.clef) for n in notes]
+        top_line = (N_STAFF_LINES - 1) * 2         # the staff's top line, in row-slots
+        lo = min([0] + slots) - self.LEDGER_PAD
+        hi = max([top_line] + slots) + self.LEDGER_PAD
+        # rows run top (highest slot) to bottom, one row per line *and* space
+        self.n_rows = hi - lo + 1
+        self._lo = lo
+
+        cols = max([self.col_of(n.start) for n in notes] + [min_cols - 1]) + 1
+        self.n_cols = max(self.per_bar, int(np.ceil(cols / self.per_bar) * self.per_bar))
+
+        self.grid = [[""] * self.n_cols for _ in range(self.n_rows)]
+        for n in notes:
+            if 0 <= (c := self.col_of(n.start)) < self.n_cols:
+                row = self._row_of(_slot(n.pitch, self.clef))
+                self.grid[row][c] = _spelling(n.pitch)
+
+        self.chord_names = [""] * self.n_cols
+        for ch in chords or []:
+            if 0 <= (c := self.col_of(ch.start)) < self.n_cols and ch.name != "N.C.":
+                self.chord_names[c] = ch.name
+
+        self.widths = [max((len(self.grid[r][c]) for r in range(self.n_rows)), default=0) + 1
+                       for c in range(self.n_cols)]
+        bar_w = [1 + sum(self.widths[b:b + self.per_bar])
+                 for b in range(0, self.n_cols, self.per_bar)]
+        self.per_line = max(1, min(len(bar_w), (max_width - 6) // max(bar_w)))
+        self.bars = [f"bar {c // self.per_bar + first_bar}" if c % self.per_bar == 0 else ""
+                     for c in range(self.n_cols)]
+
+    # --- time <-> column (identical to TabLayout, kept in step deliberately) ---
+    def col_of(self, t: float) -> int:
+        return int(round((t - self.t0) * self.tempo / 60.0 * self.subdiv))
+
+    def time_of(self, col: int) -> float:
+        return self.t0 + col * 60.0 / self.tempo / self.subdiv
+
+    def _row_of(self, slot: int) -> int:
+        """Staff slot -> row index, counting down from the top."""
+        return self._lo + self.n_rows - 1 - slot
+
+    def _is_line(self, row: int) -> bool:
+        """Whether a row (a staff line, a space, or a ledger row above/below
+        the five printed lines) falls on a drawn line - printed staff lines
+        sit on even slots (0, 2, 4, 6, 8), and so does every ledger line."""
+        slot = self._lo + (self.n_rows - 1 - row)
+        return slot % 2 == 0
+
+    # --- rendering ----------------------------------------------------------
+    def line_of(self, col: int) -> int:
+        return int(col // (self.per_bar * self.per_line))
+
+    def cols_of_line(self, line: int) -> range:
+        span = self.per_bar * self.per_line
+        return range(line * span, min((line + 1) * span, self.n_cols))
+
+    @property
+    def n_lines(self) -> int:
+        return int(np.ceil(self.n_cols / (self.per_bar * self.per_line)))
+
+    def _row_width(self, cols) -> int:
+        """Character width of one rendered row: every cell plus a separator
+        before each bar-start column and a closing one at the end - the same
+        convention `TabLayout._row` uses, so line/space/label rows all agree."""
+        return sum(self.widths[c] for c in cols) + sum(1 for c in cols if c % self.per_bar == 0) + 1
+
+    def _row(self, cols, row: int) -> str:
+        """One rendered staff row: a bar separator ('|') before every bar-start
+        column on a drawn line (a plain space on a space, so only the five
+        printed staff lines - plus ledger lines - draw a barline), each cell
+        padded to its column's width, closed the same way."""
+        fill, sep = ("-", "|") if self._is_line(row) else (" ", " ")
+        cells = "".join((sep if c % self.per_bar == 0 else "")
+                        + self.grid[row][c].ljust(self.widths[c], fill) for c in cols)
+        return cells + sep
+
+    def _label_row(self, cols, text: list[str]) -> str:
+        """Free-floating labels (chords, bar numbers) aligned to their column."""
+        buf, pos = [" "] * self._row_width(cols), 0
+        for c in cols:
+            pos += 1 if c % self.per_bar == 0 else 0
+            for i, ch in enumerate(text[c][: len(buf) - pos]):
+                buf[pos + i] = ch
+            pos += self.widths[c]
+        return "".join(buf).rstrip()
+
+    def _gutter(self, row: int) -> str:
+        """Left-edge label: the clef, and 'C' at middle C (if it's in range)."""
+        slot = self._lo + (self.n_rows - 1 - row)
+        if slot == _slot(_MIDDLE_C, self.clef):
+            return "C  "
+        if row == 0:
+            return f"{self.clef[:2]} "
+        return "   "
+
+    def line_rows(self, line: int) -> list[str]:
+        """The rendered rows of one system: chords, the staff (high to low,
+        middle C labelled if present), bars."""
+        cols = self.cols_of_line(line)
+        rows = ["   " + self._label_row(cols, self.chord_names)]
+        for row in range(self.n_rows):
+            rows.append(self._gutter(row) + self._row(cols, row))
+        rows.append("   " + self._label_row(cols, self.bars))
+        return rows
+
+    def render(self) -> str:
+        out = []
+        for line in range(self.n_lines):
+            out.extend(self.line_rows(line))
+            out.append("")
+        return "\n".join(out).rstrip()
+
+
+def render_staff(notes: list[Note], **kw) -> str:
+    """Text staff for a stem with no fretboard (piano, vocals, other): each
+    note prints as a letter name in its line/space slot rather than a fret
+    number. `kw` matches `render_tab` - tempo/t0/subdiv/first_bar/chords."""
+    if not notes:
+        return "(no notes in this window)"
+    return StaffLayout(notes, **kw).render()
+
+
 def tab_for(notes: list[Note], instrument: str | None = None, **kw) -> str:
     """Tab a note list; `instrument=None` picks guitar or bass from the range."""
     instrument = instrument or pick_instrument(notes)
