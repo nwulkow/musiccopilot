@@ -7,7 +7,7 @@ from pathlib import Path
 
 from . import audio, lyrics as lyr, notes as nt
 from .analysis import Analysis, analyze
-from .config import SR, workdir_for
+from .config import SR, base_stem, workdir_for
 from .form import Form, Part, detect_form
 
 TRANSCRIBE_STEMS = ["guitar", "bass", "vocals", "piano", "other"]
@@ -29,8 +29,10 @@ class Song:
     analysis: Analysis | None = None
     form: Form | None = None
     notes: dict[str, list[nt.Note]] = field(default_factory=dict)
+    note_backends: dict[str, str] = field(default_factory=dict)
     lyrics: list[lyr.Line] = field(default_factory=list)
     llm_notes: str = ""
+    sources: dict = field(default_factory=dict)   # set when stems were imported
 
     # --- cache helpers ------------------------------------------------------
     def _read(self, name: str):
@@ -47,8 +49,15 @@ class Song:
         return audio.load(self.path, SR, mono)
 
     def backing(self, exclude: tuple[str, ...] = ("guitar",)):
-        """The song minus the lead instrument - to solo over."""
-        keep = [s for s in self.stems if s not in exclude]
+        """The song minus the lead instrument - to solo over.
+
+        `exclude` accepts either - an instrument ("guitar" drops both of an
+        imported multitrack's guitarists, which is what you want to solo over)
+        or one exact stem ("guitar-2" drops only the second, which is what the
+        second guitarist wants from `--minus-stem`).
+        """
+        keep = [s for s in self.stems
+                if s not in exclude and base_stem(s) not in exclude]
         return audio.mix(self.stems, keep, SR) if keep else self.audio()
 
     # --- build --------------------------------------------------------------
@@ -71,6 +80,19 @@ class Song:
             song.lyrics = lyr.from_dicts(l)
         for p in (song.work / "notes").glob("*.json"):
             song.notes[p.stem] = nt.from_dicts(json.loads(p.read_text()))
+        # Which transcriber each stem's notes came from. Kept at the work root
+        # rather than inside `notes/`, which is globbed by stem name - a
+        # `notes/backends.json` would read back as a stem called "backends".
+        # Written by `daw.import_session`; its presence is what tells `run()`
+        # these stems came off a multitrack rather than out of demucs.
+        song.sources = song._read("sources.json") or {}
+        song.note_backends = song._read("note_backends.json") or {}
+        # Notes cached before the engine was selectable were produced by the
+        # old per-stem split, which is exactly `auto`. Assume that rather than
+        # treating every existing cache as unknown and re-transcribing minutes
+        # of audio the first time someone opens a song.
+        for stem in song.notes:
+            song.note_backends.setdefault(stem, nt.resolve_backend("auto", stem))
         note_file = song.work / "llm_notes.txt"
         song.llm_notes = note_file.read_text() if note_file.exists() else ""
         return song
@@ -78,7 +100,8 @@ class Song:
     def run(self, *, separate: bool = True, do_lyrics: bool = True,
             do_notes: bool = True, do_form: bool = True, do_snippets: bool = True,
             llm: bool = False, force: bool = False, whisper_size: str = "base",
-            device: str | None = None, log=print) -> "Song":
+            device: str | None = None, backend: str | None = None,
+            log=print) -> "Song":
         """Run whichever stages are missing, in cache-dependency order, and write each one.
 
         Each `do_*` flag only gates whether that stage is *eligible* to run;
@@ -91,8 +114,16 @@ class Song:
         and `form_fresh` track whether analysis/form were *just* computed this
         call (as opposed to loaded from cache) so those downstream stages know
         whether they need to redo their work too.
+
+        `backend` picks the note transcriber (`notes.BACKENDS`). Changing it is
+        a cache miss for the stems it changes, so switching engine re-does the
+        notes - and only the notes: stems, chords and lyrics are untouched.
         """
-        if separate and (force or not self.stems):
+        # Imported stems are never re-separated, `--force` included. They are
+        # the real multitrack - the thing demucs spends minutes *estimating* -
+        # so running separation over them would replace the recording with a
+        # guess at the recording, and there is no way back from that.
+        if separate and not self.sources and (force or not self.stems):
             log("• separating stems (this is the slow part)…")
             self.stems = audio.separate(self.path, device=device, force=force)
 
@@ -105,18 +136,9 @@ class Song:
             self.analysis = analyze(y, SR, harmonic=bed, vocals=voc)
             self._write("analysis.json", self.analysis.to_dict())
 
+        retranscribed: set[str] = set()
         if do_notes:
-            (self.work / "notes").mkdir(exist_ok=True)
-            # with no stems, transcribe the mix so tabs still work
-            todo = {s: self.stems[s] for s in TRANSCRIBE_STEMS if s in self.stems}
-            for stem, src in (todo or {"mix": self.path}).items():
-                if stem in self.notes and not force:
-                    continue
-                log(f"• transcribing notes: {stem}…")
-                mono = stem in ("bass", "vocals")
-                self.notes[stem] = nt.transcribe(src, stem, polyphonic=not mono)
-                (self.work / "notes" / f"{stem}.json").write_text(
-                    json.dumps(nt.to_dicts(self.notes[stem])))
+            retranscribed = self.transcribe_notes(backend=backend, force=force, log=log)
 
         if do_lyrics and "vocals" in self.stems and (force or not self.lyrics):
             log("• transcribing lyrics…")
@@ -131,8 +153,12 @@ class Song:
                                     notes=self.notes, lyrics=self.lyrics, stems=self.stems)
             self._write("form.json", self.form.to_dict())
 
-        if do_notes and (form_fresh or force) and self.form:
-            self._refine_lead_notes(log=log)
+        # `retranscribed` matters as much as `form_fresh` here: a fresh pass
+        # over a stem overwrites the monophonic splice this stage put in it,
+        # so a change of engine has to put the solos back or every bend in the
+        # tab quietly disappears.
+        if do_notes and (form_fresh or force or retranscribed) and self.form:
+            self._refine_lead_notes(backend=backend, log=log)
 
         if do_snippets and self.form:
             # new part boundaries mean the old wavs are cut in the wrong places
@@ -150,7 +176,68 @@ class Song:
                 log(f"  (skipped: {exc})")
         return self
 
-    def _refine_lead_notes(self, log=print) -> None:
+    # --- notes --------------------------------------------------------------
+    def transcribe_notes(self, sources: dict[str, Path] | None = None, *,
+                         backend: str | None = None, force: bool = False,
+                         log=print) -> set[str]:
+        """Transcribe every stem whose notes are missing - or whose cached
+        notes came from a *different* backend - and return the stems that
+        changed. Does not touch the solo splices; see `retranscribe`.
+
+        The backend each stem was read with is recorded in
+        `note_backends.json`, and that record is what makes the engine a real
+        setting: without it, asking for CREPE on a song already analysed with
+        Basic Pitch would hit the `stem in self.notes` cache check, reload the
+        old notes, and look exactly like the setting did nothing.
+        """
+        if sources is None:
+            # Keyed by instrument, not by name: an imported multitrack's
+            # `guitar-2` is as transcribable as its `guitar`, and drums are
+            # skipped whichever kit mic they came off.
+            sources = {s: p for s, p in self.stems.items()
+                       if base_stem(s) in TRANSCRIBE_STEMS}
+            # with no stems at all, transcribe the mix so tabs still work
+            sources = sources or {"mix": self.path}
+        (self.work / "notes").mkdir(parents=True, exist_ok=True)
+
+        changed: set[str] = set()
+        for stem, src in sources.items():
+            want = nt.resolve_backend(backend, stem)
+            if stem in self.notes and not force and self.note_backends.get(stem) == want:
+                continue
+            log(f"• transcribing notes: {stem} ({want})…")
+            self.notes[stem] = nt.transcribe(src, stem, backend=want)
+            (self.work / "notes" / f"{stem}.json").write_text(
+                json.dumps(nt.to_dicts(self.notes[stem])))
+            self.note_backends[stem] = want
+            changed.add(stem)
+        if changed:
+            self._write("note_backends.json", self.note_backends)
+        return changed
+
+    def retranscribe(self, backend: str | None = None, *,
+                     stems: list[str] | None = None, force: bool = False,
+                     log=print) -> set[str]:
+        """Re-read the notes with a different engine, solos included.
+
+        The cheap half of `run()`: stems, chords, lyrics and the form all stay
+        as they are, so changing your mind about the transcriber costs one
+        transcription pass rather than the whole slow pipeline. Only the lead
+        windows of stems that actually changed are refined, because a fresh
+        pass over a stem wipes the monophonic solo notes spliced into it.
+        """
+        sources = None
+        if stems is not None:
+            sources = {s: self.stems[s] for s in stems if s in self.stems}
+            if not sources:
+                raise ValueError(f"no such stems: {', '.join(stems)}")
+        changed = self.transcribe_notes(sources, backend=backend, force=force, log=log)
+        if changed and self.form:
+            self._refine_lead_notes(backend=backend, only=changed, log=log)
+        return changed
+
+    def _refine_lead_notes(self, backend: str | None = None,
+                           only: set[str] | None = None, log=print) -> None:
         """Re-transcribe each solo's lead stem monophonically over just that
         part's window, and splice the result into the cached notes.
 
@@ -165,13 +252,15 @@ class Song:
             stem = part.lead
             if not stem or stem not in self.stems or stem not in self.notes:
                 continue
+            if only is not None and stem not in only:
+                continue
             log(f"• re-transcribing {part.name} ({stem}, monophonic)…")
             clip = self.work / "_lead_tmp.wav"
             try:
                 y = audio.excerpt(audio.load(self.stems[stem], SR, mono=True),
                                   part.start, part.end, SR, fade=0.0)
                 audio.save(clip, y, SR)
-                lead_notes = nt.transcribe_lead(clip, stem)
+                lead_notes = nt.transcribe_lead(clip, stem, backend=backend)
             finally:
                 clip.unlink(missing_ok=True)
             for n in lead_notes:                # clip-local time -> song time

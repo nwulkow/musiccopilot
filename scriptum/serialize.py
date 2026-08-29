@@ -259,3 +259,22 @@ def score_json(score, *, title: str = "", stem: str = "",
             "voices": [[_score_note(n) for n in v] for v in m.voices],
         } for m in score.measures],
     }
+
+
+def session_json(session) -> dict:
+    """A DAW session on its way in: every track, and what it will become.
+
+    Carries `why` for each row because the mapping is a *guess* the user is
+    being asked to check, and "matched 'gtr'" is what makes an odd row
+    correctable rather than merely wrong.
+    """
+    return {
+        "source": str(session.source),
+        "name": session.source.stem,
+        "kind": session.kind,
+        "mixdown": session.mixdown.name if session.mixdown else "",
+        "warnings": session.warnings,
+        "tracks": [{"name": t.name, "file": t.path.name, "stem": t.stem,
+                    "why": t.why, "ignored": [p.name for p in t.extra]}
+                   for t in session.tracks],
+    }

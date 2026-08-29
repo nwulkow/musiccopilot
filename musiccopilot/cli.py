@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from . import chart, notes as nt, report, synth
-from .config import SR, TUNINGS
+from .config import SR, TUNINGS, fretboard_for
 from .form import bar_edges, bar_start
 from .pipeline import Song
 from .tabs import StaffLayout, TabLayout, fret_notes, pick_instrument, render_tab
@@ -109,12 +109,81 @@ def _load(path, need_form: bool = True) -> Song:
 
 # --- commands ----------------------------------------------------------------
 
+def cmd_import(args) -> None:
+    """Import a GarageBand project or a folder of exported stems as a song."""
+    from . import daw
+
+    session = daw.assign(daw.read_session(args.source), _mapping(args.map))
+    for w in session.warnings:
+        report.console.print(f"[yellow]{w}[/]")
+    report.console.print(f"[bold]{len(session.tracks)} tracks[/] "
+                         f"({session.kind}) from {session.source.name}:")
+    report.console.print(daw.describe(session))
+    if args.dry_run:
+        report.console.print("\n[dim]dry run - nothing written. "
+                             "Correct any row with --map \"Track name=guitar\".[/]")
+        return
+
+    path = daw.import_session(session, name=args.name, out=args.out, log=report.log)
+    report.console.print(f"[green]imported[/] → {path}")
+    if args.analyze:
+        song = Song.open(path).run(backend=args.backend, log=report.log)
+        chart.write(song)
+        report.full(song)
+    else:
+        report.console.print(f"now run: [bold]python -m musiccopilot analyze "
+                             f"{path.name}[/] (no stem separation needed)")
+
+
+def _mapping(pairs: list[str]) -> dict[str, str]:
+    """`--map "Gtr Nik=guitar"` repeated, as {track name: stem}."""
+    out = {}
+    for pair in pairs or []:
+        if "=" not in pair:
+            raise ValueError(f"--map wants 'track name=stem', got {pair!r}")
+        name, stem = pair.split("=", 1)
+        out[name.strip()] = stem.strip()
+    return out
+
+
+def cmd_tracks(args) -> None:
+    """Show, or correct, which instrument each imported track is."""
+    from . import daw
+
+    song = Song.open(args.file)
+    if not song.sources:
+        raise ValueError(f"{song.path.name} was separated, not imported - "
+                         "there are no tracks to reassign")
+    mapping = _mapping(args.map)
+    if mapping:
+        done = daw.reassign(song.work, mapping, log=report.log)
+        if not done["moves"]:
+            report.console.print("[dim]nothing to change[/]")
+        else:
+            report.console.print(f"[green]relabelled[/] {len(done['moves'])} stems; "
+                                 f"re-read: {', '.join(done['recompute'])}")
+            song = Song.open(song.path).run(backend=args.backend, log=report.log)
+            chart.write(song)
+        song = Song.open(song.path)
+
+    rows = song.sources.get("tracks") or []
+    w = max((len(r["name"]) for r in rows), default=0)
+    report.console.print(f"[bold]{len(rows)} tracks[/] "
+                         f"({song.sources.get('kind', '?')}):")
+    for r in rows:
+        report.console.print(f"  {r['name']:<{w}}  ->  {r['stem']:<10} "
+                             f"[dim]({r.get('why', '')})[/]")
+    if not mapping:
+        report.console.print("\n[dim]correct a row with "
+                             "--map \"Track3_VoiceAudio=vocals\".[/]")
+
+
 def cmd_analyze(args) -> None:
     """Run the full pipeline (stems, chords, notes, lyrics, form) and write the chart."""
     song = Song.open(args.file).run(
         separate=not args.no_separate, do_lyrics=not args.no_lyrics,
         do_notes=not args.no_notes, do_snippets=not args.no_snippets,
-        llm=args.llm, force=args.force,
+        llm=args.llm, force=args.force, backend=args.backend,
         whisper_size=args.whisper, device=args.device, log=report.log)
     if args.stem_snippets:
         song.write_snippets(stems=True, force=args.force)
@@ -165,13 +234,21 @@ def _llm_clean(song, window: list, start: float, end: float) -> list:
     This never touches the cache: it is a display-time pass, applied fresh
     each time `--llm-clean` is given, so a bad cleanup is one flag away from
     the raw transcription and never overwrites `notes/<stem>.json`.
+
+    A window past the snippet limit is reported and the raw notes are returned:
+    the tab the user asked for is still worth printing, and refusing to print
+    it as well as refusing to clean it would punish them twice for a flag.
     """
-    from .gemini import clean_solo, solo_to_notes
+    from .gemini import TooLongToClean, clean_solo, solo_to_notes
 
     if not window:
         return window
     before = len(window)
-    cleaned = clean_solo(window, song.analysis, start, end)
+    try:
+        cleaned = clean_solo(window, song.analysis, start, end)
+    except TooLongToClean as exc:
+        report.console.print(f"[yellow]llm-clean skipped:[/] {exc}")
+        return window
     out = solo_to_notes(cleaned, song.analysis.tempo, t0=start)
     report.console.print(f"[dim]llm-clean: {before} → {len(out)} notes — {cleaned.changes}[/]")
     return out
@@ -194,9 +271,8 @@ def cmd_tab(args) -> None:
     # demucs catch-all "other"): `pick_instrument` would have quietly forced
     # bass or guitar tuning on it (`--stem piano` used to print a 4-string
     # bass fretboard for a piano part). Those stems get a text staff instead.
-    fretted_stem = args.stem in TUNINGS or args.stem == "guitar"
-    instrument = ("bass" if args.stem == "bass" else
-                  "guitar" if args.stem == "guitar" else pick_instrument(window))
+    fretted_stem = fretboard_for(args.stem)
+    instrument = fretted_stem or pick_instrument(window)
     common = dict(
         tempo=a.tempo, t0=start, beats_per_bar=a.beats_per_bar, subdiv=args.subdiv,
         first_bar=report.bar_number(song, start),
@@ -448,6 +524,36 @@ def cmd_record(args) -> None:
                              f"(the take may have gaps)[/]")
 
 
+def cmd_transcribers(args) -> None:
+    """Which note transcribers this install can run - pass one as --backend."""
+    for b in nt.backend_status():
+        mark = " [green]< default[/]" if b["default"] else ""
+        state = ("[green]ready[/]" if b["available"]
+                 else f"[red]needs {', '.join(b['missing'])}[/]")
+        report.console.print(f"[bold]{b['name']}[/] - {b['kind']} - {state}{mark}")
+        report.console.print(f"  [dim]{b['summary']}[/]\n")
+
+
+def cmd_transcribe(args) -> None:
+    """Re-read a song's notes with a different transcriber.
+
+    The cheap half of `analyze`: the stems, chords, lyrics and form are left
+    alone, so trying another engine costs one transcription pass. Stems whose
+    cached notes already came from that engine are skipped unless --force.
+    """
+    song = _load(args.file, need_form=False)
+    changed = song.retranscribe(args.backend, stems=args.stem or None,
+                                force=args.force, log=report.log)
+    if not changed:
+        report.console.print("[yellow]nothing to do[/] - already transcribed with "
+                             f"[bold]{args.backend}[/] (--force to redo anyway)")
+        return
+    report.console.print(f"[green]done[/] -> {', '.join(sorted(changed))} "
+                         f"re-read with [bold]{args.backend}[/]")
+    for stem in sorted(changed):
+        report.console.print(f"  {stem}: {len(song.notes[stem])} notes")
+
+
 def cmd_models(args) -> None:
     """Which Gemini models this key can actually use - set GEMINI_MODEL to one."""
     from google import genai
@@ -472,6 +578,41 @@ def build_parser() -> argparse.ArgumentParser:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    i = sub.add_parser("import", help="import a GarageBand project or a folder of stems",
+                       description="Import a multitrack session instead of separating "
+                                   "one. Point at a .band package (GarageBand's own "
+                                   "recordings, read straight out of it), or at a folder "
+                                   "of exported stems or a zip of them (BandLab: Project "
+                                   "> Download > Tracks).")
+    i.add_argument("source",
+                   help="a .band package, a folder of per-track audio, or a zip of one")
+    i.add_argument("--name", default=None, help="song id (default: the session's name)")
+    i.add_argument("--out", default=".", help="where to write the song file")
+    i.add_argument("--map", action="append", default=[], metavar="NAME=STEM",
+                   help="override one track's stem, e.g. --map \"Gtr Nik=guitar-2\" "
+                        "(repeatable)")
+    i.add_argument("--dry-run", action="store_true",
+                   help="print the track -> stem mapping and write nothing")
+    i.add_argument("--analyze", action="store_true",
+                   help="run the analysis straight after importing")
+    i.add_argument("--backend", default=None, choices=list(nt.BACKENDS),
+                   help="note transcriber for --analyze")
+    i.set_defaults(func=cmd_import)
+
+    tk = sub.add_parser("tracks", help="show or correct an imported song's track mapping",
+                        description="Which instrument each of an imported multitrack's "
+                                    "tracks became. --map relabels a row in place: the "
+                                    "stems are renamed, the notes read with the wrong "
+                                    "instrument's model are dropped, and only what the "
+                                    "labels were load-bearing for is read again.")
+    tk.add_argument("file")
+    tk.add_argument("--map", action="append", default=[], metavar="NAME=STEM",
+                    help="move one track, e.g. --map \"Track3_VoiceAudio=vocals\" "
+                         "(repeatable); with none, just prints the mapping")
+    tk.add_argument("--backend", default=None, choices=list(nt.BACKENDS),
+                    help="note transcriber for the re-read")
+    tk.set_defaults(func=cmd_tracks)
+
     a = sub.add_parser("analyze", help="separate stems, transcribe, detect chords")
     a.add_argument("file")
     a.add_argument("--no-separate", action="store_true")
@@ -485,7 +626,22 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--device", default=None, help="cpu|cuda|mps")
     a.add_argument("--stem-snippets", action="store_true",
                    help="also cut every part into per-instrument snippets")
+    a.add_argument("--backend", default=None, choices=list(nt.BACKENDS),
+                   help=f"note transcriber (default {nt.DEFAULT_BACKEND}); "
+                        "see `musiccopilot transcribers`")
     a.set_defaults(func=cmd_analyze)
+
+    tr = sub.add_parser("transcribe", help="re-read the notes with another engine")
+    tr.add_argument("file")
+    tr.add_argument("--backend", default=nt.DEFAULT_BACKEND, choices=list(nt.BACKENDS))
+    tr.add_argument("--stem", action="append", default=[],
+                    help="limit to one stem (repeatable); default is all of them")
+    tr.add_argument("--force", action="store_true",
+                    help="redo even stems already read with that engine")
+    tr.set_defaults(func=cmd_transcribe)
+
+    sub.add_parser("transcribers", help="note transcribers this install can run") \
+       .set_defaults(func=cmd_transcribers)
 
     f = sub.add_parser("parts", help="the song's form: parts, bars, timestamps, chords")
     f.add_argument("file")

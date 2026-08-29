@@ -10,10 +10,16 @@ demucs>=4.0.1
 torch>=2.1
 
 # note transcription (optional but strongly recommended; pYIN fallback otherwise)
-# basic-pitch is polyphonic: it handles rhythm/chordal parts. torchcrepe is the
-# monophonic tracker used to re-transcribe solos, where a polyphonic model
-# invents extra notes and chops bends into steps (see notes.py). It reuses the
+# Both are selectable engines - `musiccopilot transcribers`, or Scriptum's
+# Settings pane. basic-pitch is polyphonic and the default: it handles
+# rhythm/chordal parts. torchcrepe is the monophonic tracker, and is used to
+# re-transcribe solos whatever the setting, because a polyphonic model invents
+# extra notes there and chops bends into steps (see notes.py). It reuses the
 # torch install demucs already needs - no tensorflow.
+#
+# Omnizart is not an option here: it needs madmom (which imports
+# collections.MutableSequence, gone in Python 3.10) and TensorFlow 2.5 (no 3.11
+# wheel), and demucs/basic-pitch pin this project to 3.11.
 basic-pitch>=0.4.0
 torchcrepe>=0.0.24
 # resampy (via torchcrepe) still imports pkg_resources, dropped in setuptools 81

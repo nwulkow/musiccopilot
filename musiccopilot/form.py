@@ -26,7 +26,8 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 
 from .analysis import KK_MAJOR, KK_MINOR
-from .config import CHORD_QUALITIES, FORM, NOTE_NAMES, QUALITY_SUFFIX, SR
+from .config import (CHORD_QUALITIES, FORM, NOTE_NAMES, QUALITY_SUFFIX, SR,
+                     base_stem)
 
 _QUALITY_OF = {suffix: quality for quality, suffix in QUALITY_SUFFIX.items()}
 
@@ -852,7 +853,7 @@ def detect_form(analysis, y: np.ndarray, sr: int = SR, vocals: np.ndarray | None
     # leaves behind) can never outscore the stem that is actually audible.
     loudness: dict[str, np.ndarray] = {}
     for stem, path in (stems or {}).items():
-        if stem not in LEAD_STEMS:
+        if base_stem(stem) not in LEAD_STEMS:
             continue
         try:
             import librosa
@@ -873,7 +874,7 @@ def detect_form(analysis, y: np.ndarray, sr: int = SR, vocals: np.ndarray | None
         span = max(end - start, 1e-6)
         density = {}
         for stem, ns in (notes or {}).items():
-            if stem not in LEAD_STEMS:
+            if base_stem(stem) not in LEAD_STEMS:
                 continue
             win = [n for n in ns if n.end > start and n.start < end]
             rate = len(win) / span
@@ -891,7 +892,7 @@ def detect_form(analysis, y: np.ndarray, sr: int = SR, vocals: np.ndarray | None
                 spread = min(1.0, (max(pitches) - min(pitches)) / 24.0)
                 variety = min(1.0, len(set(p % 12 for p in pitches)) / 8.0)
                 weight *= 0.4 + 0.6 * (0.5 * spread + 0.5 * variety)
-            density[stem] = rate * weight * LEAD_STEM_BIAS.get(stem, 1.0)
+            density[stem] = rate * weight * LEAD_STEM_BIAS.get(base_stem(stem), 1.0)
         segs.append(_Seg(i0, i1, fam, start, end,
                          float(voice[i0:i1].mean()), float(energy[i0:i1].mean()),
                          text, density))

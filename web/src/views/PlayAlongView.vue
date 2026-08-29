@@ -68,13 +68,27 @@ async function loadStem(s) {
   try { return await fetcher(props.id, windowParams(s)) } catch { return null }
 }
 
+// `loadLayouts` fires from four different watchers (part, stems, detail,
+// analysis), any of which can retrigger while a previous fetch is still in
+// flight - switching parts quickly enough is the normal case, not an edge
+// one. Without this token, a slower earlier request lands *after* a newer
+// one and overwrites `layouts.value` with the previous passage's notes -
+// which reads as a stem's tab silently losing notes, and does not even
+// require a slow network, just two clicks close together.
+let loadToken = 0
+
 async function loadLayouts() {
+  const token = ++loadToken
   loading.value = true
   err.value = ''
   try {
-    const got = await Promise.all(picked.value.map(loadStem))
-    layouts.value = Object.fromEntries(picked.value.map((s, i) => [s, got[i]]))
-  } catch (e) { err.value = e.message } finally { loading.value = false }
+    const stemsAtStart = picked.value
+    const got = await Promise.all(stemsAtStart.map(loadStem))
+    if (token !== loadToken) return   // superseded by a later load
+    layouts.value = Object.fromEntries(stemsAtStart.map((s, i) => [s, got[i]]))
+  } catch (e) { if (token === loadToken) err.value = e.message } finally {
+    if (token === loadToken) loading.value = false
+  }
 }
 
 /** Switching one stem's view only re-fetches that stem. */
@@ -83,7 +97,10 @@ async function setView(s, v) {
   const before = viewOf(s)
   views.value = { ...views.value, [s]: v }
   if ((before === 'sheet') !== (v === 'sheet')) {
-    layouts.value = { ...layouts.value, [s]: await loadStem(s) }
+    const token = loadToken   // same guard as loadLayouts: don't let this
+    const got = await loadStem(s)   // land after a passage/stem switch moved on
+    if (token !== loadToken) return
+    layouts.value = { ...layouts.value, [s]: got }
   }
 }
 

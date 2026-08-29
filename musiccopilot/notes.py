@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import NOTE_NAMES, PITCH_RANGE, SR, pitch_name
+from .config import NOTE_NAMES, PITCH_RANGE, SR, base_stem, pitch_name
 
 
 @dataclass
@@ -28,6 +28,104 @@ class Note:
     def duration(self) -> float:
         """Seconds, floored so a zero-length event still renders/plays as a note."""
         return max(0.03, self.end - self.start)
+
+
+# --- selectable transcription backends ---------------------------------------
+#
+# Three trackers that are wrong in different ways, so which one is least wrong
+# depends on the stem and on what you are reading the notes *for*. That choice
+# used to be hardcoded (`polyphonic=` off the stem name); it is now a setting,
+# and `auto` is the old hardcoding kept as one of the options.
+#
+# Omnizart is deliberately absent rather than merely unlisted. It cannot run
+# on this project's interpreter: it needs `madmom`, whose 0.16.1 release does
+# `from collections import MutableSequence` - removed in Python 3.10 - and
+# TensorFlow 2.5, which has no wheel for 3.11 at all. The interpreter is
+# pinned to 3.11 from the other end by demucs and basic-pitch (see CLAUDE.md),
+# so there is no version of this repo where an Omnizart backend would do
+# anything but raise ImportError. Adding one would put a permanently dead
+# entry in the settings pane.
+
+
+@dataclass(frozen=True)
+class Backend:
+    """One selectable transcriber: what it hears, and what it needs installed."""
+    name: str
+    label: str
+    kind: str                       # polyphonic | monophonic | per-stem
+    summary: str
+    modules: tuple[str, ...] = ()   # importable names it needs to run
+
+
+BACKENDS: dict[str, "Backend"] = {
+    "basic-pitch": Backend(
+        "basic-pitch", "Basic Pitch", "polyphonic",
+        "Spotify's polyphonic note model. It hears chords and several voices "
+        "at once, which is the right shape for rhythm guitar, piano and any "
+        "part that is not one line - but it invents extra notes on a quiet "
+        "stem and chops a bend into a staircase of separate pitches.",
+        ("basic_pitch",)),
+    "crepe": Backend(
+        "crepe", "CREPE", "monophonic",
+        "torchcrepe's continuous pitch contour, segmented into notes here. "
+        "One voice at a time, so it reads a bend, slide or vibrato as a "
+        "technique instead of new notes: the best reading of a solo, a "
+        "bassline or a vocal melody, and the wrong model for chords.",
+        ("torchcrepe", "torch")),
+    "pyin": Backend(
+        "pyin", "pYIN (librosa)", "monophonic",
+        "librosa's pYIN tracker, quantised straight to the nearest semitone. "
+        "The lightest option and the fallback whenever another backend will "
+        "not import; it hears no chords and no technique.",
+        ("librosa",)),
+    "auto": Backend(
+        "auto", "Auto (per stem)", "per-stem",
+        "What the pipeline did before the engine was a choice: pYIN for bass "
+        "and vocals, Basic Pitch for everything else.",
+        ("basic_pitch", "librosa")),
+}
+
+DEFAULT_BACKEND = "basic-pitch"
+_MONO_STEMS = ("bass", "vocals")     # the stems `auto` treats as one voice
+
+
+def resolve_backend(backend: str | None, instrument: str = "other") -> str:
+    """The concrete backend `backend` means for `instrument`.
+
+    Only `auto` looks at the stem; every other choice is the same tracker on
+    every part, which is the point of choosing it. Callers store the *resolved*
+    name, so a cache records the tracker that actually ran rather than the
+    word the user picked.
+    """
+    name = backend or DEFAULT_BACKEND
+    if name not in BACKENDS:
+        raise ValueError(f"unknown transcriber {name!r}; have {', '.join(BACKENDS)}")
+    if name == "auto":
+        return "pyin" if base_stem(instrument) in _MONO_STEMS else "basic-pitch"
+    return name
+
+
+def backend_missing(name: str) -> list[str]:
+    """Modules `name` needs that this install cannot import."""
+    from importlib.util import find_spec
+
+    missing = []
+    for mod in BACKENDS[name].modules:
+        try:
+            if find_spec(mod) is None:
+                missing.append(mod)
+        except (ImportError, ValueError):       # a broken or namespace-less parent
+            missing.append(mod)
+    return missing
+
+
+def backend_status() -> list[dict]:
+    """Every backend plus whether this install can actually run it - what
+    `musiccopilot transcribers` prints and what the web settings pane lists."""
+    return [{"name": name, "label": b.label, "kind": b.kind, "summary": b.summary,
+             "missing": (missing := backend_missing(name)), "available": not missing,
+             "default": name == DEFAULT_BACKEND}
+            for name, b in BACKENDS.items()]
 
 
 def _basic_pitch(path: Path, fmin: float, fmax: float) -> list[Note]:
@@ -295,28 +393,61 @@ def _segment_contour(times, midi, periodicity) -> list[Note]:
     return notes
 
 
+def _transcriber(name: str):
+    """The function that runs backend `name`. Resolved late so that importing
+    this module never imports torch or TensorFlow (see CLAUDE.md on lazy
+    imports) - the registry above is pure metadata."""
+    return {"basic-pitch": _basic_pitch, "crepe": _crepe_notes, "pyin": _pyin}[name]
+
+
 def transcribe(path: str | Path, instrument: str = "other",
-               polyphonic: bool = True) -> list[Note]:
-    """Transcribe one stem. Uses Basic Pitch if installed, else pYIN."""
+               polyphonic: bool | None = None,
+               backend: str | None = None) -> list[Note]:
+    """Transcribe one stem with the chosen backend, falling back to pYIN.
+
+    `backend` is a key of `BACKENDS`; None means `DEFAULT_BACKEND`. The older
+    `polyphonic` flag is still honoured when no backend is given, and means
+    exactly what it used to - Basic Pitch or pYIN - so a caller that has not
+    been taught about backends keeps its previous behaviour rather than
+    silently changing engine.
+
+    pYIN is the floor, not a peer: every other backend is an optional
+    dependency, and a missing one has always degraded to pYIN rather than
+    failing the whole analysis run.
+    """
     path = Path(path)
-    fmin, fmax = PITCH_RANGE.get(instrument, PITCH_RANGE["other"])
-    if polyphonic:
-        try:
-            return _basic_pitch(path, fmin, fmax)
-        except Exception as exc:                   # noqa: BLE001 - optional dep
-            print(f"[transcribe] basic-pitch unavailable ({exc}); pYIN for {instrument}")
-    return _pyin(path, fmin, fmax)
+    fmin, fmax = PITCH_RANGE.get(base_stem(instrument), PITCH_RANGE["other"])
+    if backend is None and polyphonic is not None:
+        backend = "basic-pitch" if polyphonic else "pyin"
+    name = resolve_backend(backend, instrument)
+    try:
+        return _transcriber(name)(path, fmin, fmax)
+    except Exception as exc:                       # noqa: BLE001 - optional dep
+        if name == "pyin":
+            raise
+        print(f"[transcribe] {name} unavailable ({exc}); pYIN for {instrument}")
+        return _pyin(path, fmin, fmax)
 
 
-def transcribe_lead(path: str | Path, instrument: str = "guitar") -> list[Note]:
+def transcribe_lead(path: str | Path, instrument: str = "guitar",
+                    backend: str | None = None) -> list[Note]:
     """Monophonic re-transcription for a single lead line (a solo, a riff).
 
     Prefers the CREPE-based tracker (continuous pitch -> real bends/slides
     instead of quantised note fragments); falls back to pYIN if torch/
     torchcrepe are not installed.
+
+    This stage is monophonic whatever backend the rest of the stem used - that
+    is the entire point of it (see `pipeline._refine_lead_notes`), so choosing
+    a polyphonic engine does not turn it off; it would only put Basic Pitch's
+    staircase back into the one window that most needs a contour. The one
+    choice honoured here is an explicit pYIN: someone who picked the lightest
+    tracker on purpose should not have torch loaded behind their back.
     """
     path = Path(path)
-    fmin, fmax = PITCH_RANGE.get(instrument, PITCH_RANGE["other"])
+    fmin, fmax = PITCH_RANGE.get(base_stem(instrument), PITCH_RANGE["other"])
+    if resolve_backend(backend, instrument) == "pyin":
+        return _pyin(path, fmin, fmax)
     try:
         return _crepe_notes(path, fmin, fmax)
     except Exception as exc:                       # noqa: BLE001 - optional dep

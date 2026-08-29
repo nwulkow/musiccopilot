@@ -8,6 +8,7 @@ from rich.table import Table
 
 from . import notes as nt
 from .analysis import common_progressions, find_riffs
+from .config import fretboard_for
 from .form import bar_edges, bar_index, reference_part
 from .tabs import chord_chart, pick_instrument, scale_notes, tab_for
 
@@ -146,7 +147,7 @@ def riffs(song, stem: str = "guitar", count: int = 3) -> None:
         console.print(f"[dim]no transcribed notes for '{stem}'[/]")
         return
     a = song.analysis
-    inst = "bass" if stem == "bass" else ("guitar" if stem == "guitar" else pick_instrument(ns))
+    inst = fretboard_for(stem) or pick_instrument(ns)
     found = find_riffs(ns, top=count)
     if not found:
         console.print(f"[dim]no dense passages found in '{stem}'[/]")

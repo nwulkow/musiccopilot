@@ -62,6 +62,11 @@ watch(() => route.path, (p) => { if (p.startsWith('/library') || p.startsWith('/
       <RouterLink to="/live/key" class="navitem">
         <span class="ico">◐</span> Live key
       </RouterLink>
+
+      <div class="eyebrow navhead">This install</div>
+      <RouterLink to="/settings" class="navitem">
+        <span class="ico">◇</span> Settings
+      </RouterLink>
     </nav>
 
     <div class="foot">

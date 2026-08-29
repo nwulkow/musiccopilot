@@ -48,7 +48,16 @@ export function useTransport() {
       })
       a.addEventListener('play', () => { playing.value = true; tick() })
       a.addEventListener('pause', () => { playing.value = false })
-      a.addEventListener('ended', () => { playing.value = false })
+      // Reaching the end leaves `currentTime` sitting at `duration` (or, for
+      // a region, wherever `tick()`'s own pause-and-rewind left it). Without
+      // rewinding here, pressing play again re-triggers 'ended' immediately -
+      // there is nothing left downstream of `currentTime` to play - which
+      // looks exactly like the transport refusing to start.
+      a.addEventListener('ended', () => {
+        playing.value = false
+        a.currentTime = region.value ? region.value.start : 0
+        time.value = a.currentTime
+      })
       a.addEventListener('error', () => { error.value = 'could not load audio'; ready.value = false })
       el.value = a
     }
@@ -98,9 +107,12 @@ export function useTransport() {
     osc.stop(at + 0.09)
   }
 
+  let starting = false
   async function play() {
     const a = audio()
-    if (!a.src) return
+    if (!a.src || starting) return
+    starting = true
+    try {
     // The count-in is generated at the tempo you will actually hear, i.e.
     // after the rate change - clicking at the written tempo and then playing
     // back slowed is the one thing a count-in must not do.
@@ -117,6 +129,7 @@ export function useTransport() {
       countingIn.value = 0
     }
     try { await a.play() } catch (e) { error.value = String(e.message || e) }
+    } finally { starting = false }
   }
 
   function pause() { el.value && el.value.pause() }

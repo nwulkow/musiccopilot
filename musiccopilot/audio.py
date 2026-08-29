@@ -7,7 +7,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 
-from .config import SR, workdir_for
+from .config import SR, base_stem, workdir_for
 
 # htdemucs_6s splits into these; the plain htdemucs model has no guitar/piano.
 SIX_STEMS = ["drums", "bass", "other", "vocals", "guitar", "piano"]
@@ -85,7 +85,13 @@ def excerpt(y: np.ndarray, start: float, end: float, sr: int = SR,
 
 
 def mix(stem_paths: dict[str, Path], include: list[str], sr: int = SR) -> np.ndarray:
-    """Sum a subset of stems back together (e.g. a backing track)."""
+    """Sum a subset of stems back together (e.g. a backing track).
+
+    `include` is exact stem names. Callers that mean *instruments* - "every
+    guitar", however many an imported multitrack has - go through `stems_of`
+    first, so that widening stays visible at the call site rather than hiding
+    in here where a precise exclusion would silently be undone.
+    """
     parts = [load(p, sr) for name, p in stem_paths.items() if name in include]
     if not parts:
         return np.zeros(1, dtype=np.float32)
@@ -96,6 +102,11 @@ def mix(stem_paths: dict[str, Path], include: list[str], sr: int = SR) -> np.nda
     return total
 
 
+def stems_of(stem_paths: dict[str, Path], instruments: list[str]) -> list[str]:
+    """Every stem belonging to one of `instruments` - `guitar` finds `guitar-2` too."""
+    return [name for name in stem_paths if base_stem(name) in instruments]
+
+
 def harmonic_bed(stem_paths: dict[str, Path], sr: int = SR) -> np.ndarray:
     """Pitched content only (no drums, no vocals) - the best input for chords."""
-    return mix(stem_paths, ["bass", "other", "guitar", "piano"], sr)
+    return mix(stem_paths, stems_of(stem_paths, ["bass", "other", "guitar", "piano"]), sr)

@@ -83,7 +83,14 @@ function llmClean() {
       },
       onError: () => { cleaning.value = false; cleanNote.value = ''; err.value = 'lost the cleanup stream' },
     }))
-    .catch((e) => { cleaning.value = false; cleanNote.value = ''; err.value = e.message })
+    .catch((e) => {
+      cleaning.value = false
+      cleanNote.value = ''
+      // The server refuses an oversized window up front rather than running
+      // the job, so this is the ordinary path when a whole-song tab is on
+      // screen - it deserves the server's sentence, not "400".
+      err.value = e.detail?.error === 'window_too_long' ? e.detail.detail : e.message
+    })
 }
 
 /** Keep the URL describing what is on screen, so a passage can be linked to. */
@@ -108,6 +115,29 @@ function pickPart(p) {
 
 
 const noteCount = computed(() => layout.value?.notes?.length || 0)
+
+/**
+ * Whether cleanup applies to what is on screen.
+ *
+ * Cleanup is a snippet operation: the model is sent the window and writes it
+ * back, so a whole-song request costs both ways and is roughly a hundred times
+ * a solo. The limit itself lives in `musiccopilot.config` and arrives on the
+ * layout (`clean_ok` / `clean_size`) - keeping a second copy of the numbers
+ * here is how the browser and the CLI would come to disagree about what a
+ * snippet is.
+ */
+const cleanOk = computed(() => layout.value?.clean_ok !== false)
+const cleanWhy = computed(() => {
+  if (!health.value.gemini) return 'Set GEMINI_API_KEY to use this'
+  if (shown.value === 'sheet') return 'Cleanup applies to the tab, not the engraved score'
+  const s = layout.value?.clean_size
+  if (!cleanOk.value && s) {
+    return `This passage is ${s.notes} notes over ${Math.round(s.seconds)}s. `
+         + `Cleanup takes up to ${s.max_notes} notes / ${Math.round(s.max_seconds)}s `
+         + '— pick a part or a bar range below.'
+  }
+  return 'Ask Gemini to merge jittered notes and drop noise'
+})
 const kindLabel = computed(() => {
   const l = layout.value
   if (!l) return ''
@@ -200,10 +230,13 @@ const kindLabel = computed(() => {
             </span>
             <button
               class="btn btn-sm"
-              :disabled="cleaning || !health.gemini || shown === 'sheet'"
-              :title="health.gemini ? 'Ask Gemini to merge jittered notes and drop noise' : 'Set GEMINI_API_KEY to use this'"
+              :disabled="cleaning || !health.gemini || shown === 'sheet' || !cleanOk"
+              :title="cleanWhy"
               @click="llmClean"
             >{{ cleaning ? 'Cleaning…' : 'Clean up' }}</button>
+            <span v-if="!cleanOk && health.gemini && shown !== 'sheet'" class="dim tiny">
+              pick a part to clean
+            </span>
             <span v-if="cleanNote" class="dim tiny mono">{{ cleanNote }}</span>
             <div class="seg">
               <button

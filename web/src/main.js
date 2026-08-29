@@ -22,6 +22,7 @@ const routes = [
       { path: 'solo', name: 'solo', component: () => import('./views/SoloView.vue'), props: true },
     ],
   },
+  { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },
   { path: '/live/tab', name: 'live-tab', component: () => import('./views/LiveTabView.vue') },
   { path: '/live/key', name: 'live-key', component: () => import('./views/LiveKeyView.vue') },
   { path: '/:pathMatch(.*)*', redirect: '/library' },
@@ -32,5 +33,31 @@ const router = createRouter({
   routes,
   scrollBehavior: () => ({ top: 0 }),
 })
+
+// A rebuild fingerprints every chunk, so a tab left open across one asks for a
+// lazy view that no longer exists. The import rejects, vue-router abandons the
+// navigation, and the link is dead for the life of the tab - which looks
+// exactly like a broken button, with nothing on screen to say why. One reload
+// puts the tab on the current build. `_SPAFiles` deliberately 404s a missing
+// asset rather than answering it with the shell, which is what makes this
+// failure identifiable at all instead of an HTML MIME-type error.
+const STALE = /dynamically imported module|Importing a module script failed|MIME type|Failed to fetch/i
+const RETRIED = 'scriptum:reloaded-for'
+
+function once(key, path) {
+  // Guarded so a chunk that is genuinely broken cannot become a reload loop:
+  // one reload per route, cleared as soon as any navigation succeeds.
+  try {
+    if (sessionStorage.getItem(key) === path) return false
+    sessionStorage.setItem(key, path)
+  } catch { /* private mode: one reload is still better than a dead link */ }
+  return true
+}
+
+router.onError((err, to) => {
+  if (!STALE.test(err?.message || '')) return
+  if (once(RETRIED, to.fullPath)) window.location.assign(to.fullPath)
+})
+router.afterEach(() => { try { sessionStorage.removeItem(RETRIED) } catch { /* ignore */ } })
 
 createApp(App).use(router).mount('#app')

@@ -19,6 +19,12 @@ set -a; source .env; set +a
 ## Commands
 
 ```bash
+python -m musiccopilot import "Practice.band" --dry-run   # what each track would become
+python -m musiccopilot import "Practice.band" --analyze   # GarageBand, no separation
+python -m musiccopilot import ./bandlab-stems --map "Acoustic=guitar-2"
+python -m musiccopilot tracks song.wav                    # what each imported track became
+python -m musiccopilot tracks song.wav --map "Track3_VoiceAudio=vocals"
+
 python -m musiccopilot analyze song.mp3 --llm      # full pass, writes the cache
 python -m musiccopilot parts song.mp3              # the form: parts, bars, times, chords
 python -m musiccopilot chart song.mp3              # the recreate sheet (also -> chart.md)
@@ -29,6 +35,10 @@ python -m musiccopilot tab song.mp3 --part "guitar solo" --stem guitar --llm-cle
 python -m musiccopilot snippets song.mp3 --stems   # re-cut the per-part wavs
 python -m musiccopilot solo song.mp3 --prompt "slow bluesy" --play
 python -m musiccopilot models                      # Gemini models this key can reach
+
+python -m musiccopilot transcribers                # note engines this install can run
+python -m musiccopilot analyze song.mp3 --backend crepe
+python -m musiccopilot transcribe song.mp3 --backend crepe --stem guitar
 
 python -m musiccopilot tab song.mp3 --part "guitar solo" --follow   # play along
 python -m musiccopilot tab song.mp3 --bars 97-112 --follow --minus-stem --count-in 4
@@ -50,7 +60,8 @@ merge pitch-jitter fragments, correct octave errors and drop spurious
 noise-floor notes before the tab is rendered. It is a display-time pass over
 whatever `--part`/`--bars`/`--start`/`--end` selected - it never writes
 `notes/<stem>.json`, so a bad cleanup costs nothing but re-running without
-the flag.
+the flag. It is capped to a **snippet** (`LLM_CLEAN_MAX_NOTES` /
+`LLM_CLEAN_MAX_SECONDS`); see "What a Gemini button is allowed to cost".
 
 There is no test suite, linter config, or build step. To smoke-test a change, run against
 the checked-in `crystallize.mp3` — its stems, notes, lyrics and analysis are already in
@@ -76,6 +87,7 @@ computes only the missing stages. Each stage is independently cached:
 | `stems/*.wav` | Demucs separation |
 | `analysis.json` | tempo, beats, key, chords, structure |
 | `notes/<stem>.json` | per-stem note transcription (rewritten after `form.json` for solo stems) |
+| `note_backends.json` | which transcriber each stem's notes came from |
 | `lyrics.json` | Whisper on the vocal stem |
 | `form.json` | song form — needs notes + lyrics, so it runs after both |
 | `snippets/*.wav` | one audio excerpt per part (`--stems` also writes per-instrument) |
@@ -193,6 +205,191 @@ wav filenames, the keys of `Song.stems` and `Song.notes`, the `--stem` CLI value
 `PITCH_RANGE`, and the entries of `TRANSCRIBE_STEMS`. Renaming one means touching all of them.
 `pipeline.run` picks the transcriber by stem: `bass`/`vocals` → monophonic pYIN, everything
 else → polyphonic Basic Pitch. With no stems at all it transcribes the raw mix as `"mix"`.
+
+**A stem name is no longer the same thing as an instrument.** Separation can only ever produce
+one guitar, but an imported multitrack (below) has two guitarists and a backing vocal, so a
+stem may carry a `-2` suffix — `guitar-2` is its own stem, its own `notes/guitar-2.json` and
+its own tab, while being a guitar for every lookup keyed by instrument. `config.base_stem`
+does that strip, and **every** dict keyed by instrument goes through it: `PITCH_RANGE` and the
+`auto` backend's mono/poly split in [notes.py](musiccopilot/notes.py), `LEAD_STEMS` and
+`LEAD_STEM_BIAS` in [form.py](musiccopilot/form.py), `TRANSCRIBE_STEMS` in
+[pipeline.py](musiccopilot/pipeline.py), and `TUNINGS` via `config.fretboard_for` — which also
+replaced three copies of the `stem in TUNINGS or stem == "guitar"` idiom in `cli`, `app` and
+`chart` with one. Miss one and a second guitarist gets `other`'s pitch window, or a fretboard
+it has no strings for. Names that are not a suffixed canonical stem (`mix`) come back
+unchanged, so `.get(name, default)` lookups behave exactly as they did.
+
+`audio.mix` deliberately did **not** get this treatment: it matches exact names, and callers
+that mean "every guitar" call `audio.stems_of` first. Widening inside `mix` would have made
+`Song.backing(exclude=("guitar-2",))` silently put guitar-2 back into the bed it was excluded
+from. `backing` itself accepts either — an instrument drops every stem of it (what you want to
+solo over), one exact stem name drops only that one (what the second guitarist wants from
+`--minus-stem`).
+
+### Importing a DAW multitrack skips separation entirely
+
+[daw.py](musiccopilot/daw.py) (`musiccopilot import`) writes the stems demucs would otherwise
+have *estimated*. Nothing downstream changes: it fills `analyzed_songs/<id>/stems/`, sums a
+mixdown to be `Song.path`, and `analyze` then runs from `analysis.json` onward as usual. The
+cache layout is the import API — that is why the feature is one module and not a second
+pipeline.
+
+This is a quality change, not only a speed one. Three problems documented elsewhere in this
+file are separation damage and simply do not occur on a real multitrack: `other` holding bleed
+from whichever stem demucs did not split cleanly, `harmonic_bed` feeding chord detection a
+reconstruction rather than the instruments, and Basic Pitch firing on the noise floor of a
+near-silent stem (the "Piano solo" that was a guitar).
+
+Three front doors, because the two DAWs give you different things and hand them over from
+different places:
+
+- **A folder of per-track audio** is exact, and the only thing BandLab needs (Project →
+  Download → Tracks gives full-length WAVs from zero). One file per track; a file named like a
+  mixdown (`master`, `mix`, `bounce`) is taken as the song's audio instead of as a stem.
+- **A `.zip` of that folder** is the same door with a lid on. `_unzip` extracts it to the temp
+  directory, keyed by the zip's path/mtime/size and reused, because the web layer reads a
+  session twice — once to show the mapping, once to import the corrected one — and unpacking a
+  few hundred MB of WAV twice to answer the same question is not a cost worth paying.
+  `_unwrap` then descends through folders that contain nothing but one folder, since Finder and
+  BandLab both wrap a download in a folder named after itself. `Session.source` stays the
+  *zip*, so `sources.json` records where the tracks came from rather than a temp path nobody
+  should be sent back to.
+- **A `.band` package** is read directly out of `Media/`. GarageBand has no stem export at all
+  — the documented route is solo-and-export, once per track — but the package is a folder and
+  the recorded takes are sitting in it. The cost is one assumption: **that each region starts
+  at bar 1.** Where a region actually sits on the timeline lives in `projectData`, an
+  undocumented Apple format, and inventing an answer would be worse than stating the limit.
+  For the case this is for — a practice room, one take, everyone playing through — it holds
+  exactly. `Output/` is used as the mix when GarageBand has bounced one, since the band's own
+  fader balance beats anything summed here.
+
+A track with several regions is the edited case, and `_group_regions` keeps only the longest
+and warns. Laying regions end to end would invent an arrangement nobody played; for repeated
+takes of one song the longest region *is* the take, and for a punch-in it is everything but
+the fix — which the warning says out loud so the folder door is one sentence away.
+
+**The GarageBand door is gated by TCC, and the block is not Scriptum's to fix.** On current
+macOS `~/Music/GarageBand` is protected, so `readable()` is refused a path it knows perfectly
+well. The part worth knowing is *whose* refusal it is: TCC grants nothing to `python`, it
+grants to the application that launched it, so the toggle is filed under Terminal or VS Code
+and someone told to "grant Scriptum access" is looking for a row that cannot exist.
+`responsible_app()` walks the process ancestry to the outermost `.app` bundle and `_tcc_hint`
+names it. It offers Full Disk Access and *not* Files and Folders, because that pane has no add
+button — its rows appear only after an app has asked and been answered, which is no use to
+someone already looking at the failure. The other route it offers needs no permission at all:
+copy the project out in Finder. `reveal()` (`open -R`, `POST /api/daw/reveal`) is as far as the
+app can help with that — Finder does the opening, so it works on a blocked path, but the drag
+itself cannot be automated: the app may not copy what it may not read.
+
+`_classify` maps track names onto stems in two tiers, and the tiers matter more than the word
+lists. A name that says the instrument (`Gtr Nik`, `Gesang`, `Drum Kit OH`) ranks above one
+that only implies it (`Acoustic`, `Lead`, `DI`), and `assign` allocates **most-confident
+first** — so "Electric Guitar" takes `guitar` and a track called just "Acoustic" becomes
+`guitar-2`, rather than whichever the filesystem listed first. The same split is what lets
+"Acoustic Piano" be a piano while bare "Acoustic" is a guitar, without the scoring having to
+arbitrate. `--dry-run` prints the whole mapping with its reasons and writes nothing; `--map
+"Rhythm Gitarre=guitar-2"` overrides a row, and an override naming an exact slot claims it
+before anything is auto-numbered.
+
+**The two tiers also match differently, and that is not cosmetic.** A strong keyword may be a
+substring — `git` is in the list precisely to catch "Gitarre" — but a weak one has to be a
+whole word (`_WEAK_WORD`, letters as the boundary so "Amp2" and "Mic1" still match). Weak
+words are short and standalone, and matching those loosely is actively wrong: `di` means a DI
+box, and it is also the middle of **Au*di*o**. BandLab names every mic-recorded track
+`VoiceAudio` by default, so a whole band's vocals imported as guitars — and a vocal track
+labelled `guitar` is not a visible error, it is an empty Lyrics tab, because `pipeline.run`
+transcribes lyrics from the stem literally called `vocals`. `voice` is in the strong vocals
+list for the other half of the same case.
+
+**`sources.json` is load-bearing, not a receipt.** Its presence is what makes
+`pipeline.run` skip separation *even under `--force`*: running demucs over imported stems
+would replace the recording with a guess at the recording, and there is no way back. It also
+records which of the band's tracks each stem was, which nothing else can reconstruct —
+`guitar-2` could be either guitarist.
+
+That record is also what makes the mapping **correctable after the fact**. `daw.reassign`
+(`musiccopilot tracks --map`, `POST /api/songs/{id}/tracks`, the `TrackPanel` beside the song
+title) renames the stems in place rather than re-importing: the audio was always right, only
+the labels on it were wrong, and re-importing to fix one row would mean handing over the whole
+multitrack again. Four things it has to get right:
+
+- **The renames may be a permutation.** Two guitarists swapping is `guitar → guitar-2` and
+  `guitar-2 → guitar` at once, so `_shuffle` parks every file under a temporary name before
+  any takes its final one. The temporary keeps the real suffix in the middle
+  (`guitar.wav.moving`), so a crash between the passes leaves nothing the `stems/*.wav` glob
+  reads back as a stem called `~guitar`.
+- **Notes travel or die by instrument.** A track that only changed number is the same
+  instrument on the same audio and its notes are relabelled with it; a change of instrument
+  means they were read with the wrong `PITCH_RANGE` and the wrong mono/poly split, so they are
+  dropped and read again. `note_backends.json` is re-keyed either way.
+- **Only an instrument change is expensive.** Chords come from `audio.harmonic_bed`, which is
+  the stems *minus* drums and vocals, so a track crossing that line means they were detected
+  over different audio — `analysis.json` and `lyrics.json` go. A pure renumber leaves both
+  standing: same files, same groups. The form reads stem *names* (which one is a part's lead),
+  so `form.json`, `snippets/` and `chart.md` go either way. The mixdown never does; it is the
+  same tracks summed in the same proportions.
+- **Untouched rows renumber densely around the choice**, the same rule `assign` uses at import.
+  Move one of two guitars to `vocals` and the other becomes `guitar`, not a lone `guitar-2`
+  reading as a second guitarist who is not there.
+
+The work runs inside a job rather than the request even though the renames themselves are
+instant, because `JOBS.start`'s one-per-song rule is what stops it renaming files out from
+under a running analysis. The argument checking is duplicated in the endpoint so a bad row is
+a 400 rather than something to dig out of a failed job's transcript.
+
+### The transcriber is a setting, and the cache remembers which one ran
+
+`notes.BACKENDS` is the registry of note transcribers, `notes.DEFAULT_BACKEND`
+is `basic-pitch`, and `notes.resolve_backend(name, stem)` turns a choice into
+the tracker that actually runs. Four entries: `basic-pitch` (polyphonic),
+`crepe` (torchcrepe's contour through `_segment_contour`, so it keeps bends),
+`pyin` (librosa, the floor every other backend degrades to) and `auto` — the
+old hardcoded split, pYIN for `bass`/`vocals` and Basic Pitch for everything
+else, kept as an option because it was the behaviour of every cache written
+before the choice existed.
+
+The registry is **metadata only**: `_transcriber()` maps a name to a function
+at call time, so importing `notes.py` still does not import torch or
+TensorFlow (see "Lazy imports are deliberate"). `backend_status()` reports
+per-backend availability by `find_spec`, which is what the `transcribers`
+command and the web settings pane list — every backend but pYIN is optional,
+and an engine that cannot import should be explained in a list rather than
+blow up mid-analysis.
+
+**`note_backends.json` is what makes it a setting rather than a no-op.** The
+notes stage is cached per stem, so without a record of which engine wrote
+`notes/guitar.json`, asking for CREPE on an already-analysed song would hit
+`stem in self.notes`, reload the Basic Pitch notes and look exactly like the
+setting did nothing. `Song.transcribe_notes` treats a backend mismatch as a
+cache miss; `Song.open` backfills a missing record as `auto`, because that is
+genuinely what produced every pre-existing cache — the alternative is
+re-transcribing minutes of audio the first time anyone opens an old song.
+
+It lives at the work root and **not** in `notes/`, which is globbed by stem
+name: a `notes/backends.json` would load back as a stem called "backends".
+
+`Song.retranscribe` is the cheap half of `run()` — stems, chords, lyrics and
+form are left alone — and it re-refines the lead windows of **only** the stems
+that changed, because a fresh pass over a stem overwrites the monophonic solo
+notes spliced into it. `run()` passes `retranscribed` into the same condition
+for the same reason: change the engine without that and every bend in the tab
+silently disappears.
+
+Two deliberate asymmetries. Changing the default to `basic-pitch` means an old
+cache's `bass` and `vocals` (pYIN under `auto`) are re-read on the next
+`analyze`; that is the default actually changing, not a bug. And
+`transcribe_lead` stays monophonic whatever the stem's backend is — that stage
+exists precisely because a polyphonic model is wrong on one string at a time —
+so only an explicit `pyin` is honoured there, since someone who picked the
+lightest tracker should not get torch loaded behind their back.
+
+**Omnizart is deliberately not a backend.** It needs `madmom`, whose 0.16.1
+release does `from collections import MutableSequence` (removed in Python 3.10)
+and fails to build without Cython and setuptools declared; and TensorFlow 2.5,
+which has no 3.11 wheel. This repo is pinned to 3.11 from the other end by
+demucs and basic-pitch, so the two requirements have no overlapping version.
+An Omnizart entry could only ever be a permanently dead row in the settings
+pane. Do not add one back without checking that both constraints have moved.
 
 ### Solos are re-transcribed monophonically
 
@@ -468,22 +665,63 @@ element on `requestAnimationFrame`, never from a `Date.now()` clock started
 next to it — the same reason `playalong.Transport` reads the audio callback's
 frame counter, and the same failure if you don't.
 
+**The engine choice is the client's, the engine list is the server's.**
+`/api/transcribers` reports `notes.backend_status()` — whether torchcrepe
+imports is a fact about the machine Scriptum runs on, so the settings pane
+never keeps its own copy of the list. The preference itself is browser-local
+(`composables/useSettings.js`, one shared reactive object so the pane and the
+song pages cannot disagree), and it stores `null` for "follow the server's
+default" rather than freezing today's default into every browser.
+`POST /api/songs/{id}/transcribe` is `Song.retranscribe` as a job: `SongView`
+offers it whenever a song's `note_backends` disagree with the chosen engine,
+which is the normal state of any song analysed before the setting existed.
+
+**The BandLab door is the one thing the browser uploads.** Every other import question is
+about the *server's* filesystem, which is right when Scriptum is on the machine the session is
+on — a `.band` is a package a file input cannot carry anyway. BandLab is the case where it is
+not: there is no public API to pull a project's tracks from, so the handover is a download,
+and it comes out of whatever browser was doing the downloading. `POST /api/daw/upload` takes
+those files (or a folder, walked through `webkitGetAsEntry`, or a zip) into a staging folder
+under `library_root()/.imports` and returns its path, so `daw_preview` and `daw_import` read it
+exactly as if someone had pointed at it — the import path does not learn a new shape. Staging
+is scaffolding: `import_session` transcodes every track into `stems/` anyway, so anything older
+than a day is pruned on the next upload, and `mkdtemp` names the folder because two uploads a
+second apart would otherwise merge into one.
+
 **Slow work is a job, not a request** (`jobs.py`, progress over SSE from
 `/api/jobs/{id}/stream`). Analysis is minutes; the Gemini calls are tens of
-seconds and *highly variable* — the same 75-note cleanup measured 48s once and
-over 110s the next time on identical input. `clean_solo` and `suggest_solo`
-have no timeout of their own, so `Jobs.start` takes a `timeout` that is a
+seconds and *variable* — the same 75-note cleanup measured 48s once and over
+110s the next time on identical input, which the fixed thinking budgets have
+since brought to ~11s (see "What a Gemini button is allowed to cost"), but a
+model that decides to think is still not a request you hold open. `clean_solo`
+and `suggest_solo` have no timeout of their own, so `Jobs.start` takes a
+`timeout` that is a
 **reporting deadline, not a kill**: Python cannot interrupt a thread blocked in
 a socket read, so the job is marked failed, the orphaned daemon thread is left
 to die with the process, and a late result is discarded rather than
 overwriting the reported failure. `SCRIPTUM_LLM_TIMEOUT` overrides the 300s
 default. One analysis per song at a time, or two runs race on the same cache.
 
-**Deep links need the SPA fallback.** `StaticFiles(html=True)` only serves
-`index.html` for a *directory*; every other miss is a 404, so reloading
-`/song/x/tabs` broke until `_SPAFiles` fell back to the shell. It deliberately
-does not do that for `/api` or `/ws`, so a mistyped endpoint still fails as an
-endpoint instead of quietly returning HTML.
+**Deep links need the SPA fallback — and a built asset must not get it.**
+`StaticFiles(html=True)` only serves `index.html` for a *directory*; every
+other miss is a 404, so reloading `/song/x/tabs` broke until `_SPAFiles` fell
+back to the shell. It deliberately does not do that for `/api` or `/ws`, so a
+mistyped endpoint still fails as an endpoint instead of quietly returning HTML.
+
+Anything under `assets/`, and anything with a built file's suffix
+(`_SPAFiles.ASSETS`), is excluded for a sharper reason. Vite fingerprints every
+lazy route into its own chunk, so a tab left open across an `npm run build`
+asks for `LibraryView-<old hash>.js`, which no longer exists — and answering
+*that* with the shell hands the browser HTML where it asked for a JavaScript
+module. The import rejects, vue-router abandons the navigation, and the link is
+**dead for the life of that tab**, with nothing in the network log but a 200
+and nothing on screen at all. It presents as "I cannot click on Library any
+more". A real 404 is what makes the failure identifiable, and `main.js`
+(`router.onError`) then reloads once onto the current build — guarded by a
+`sessionStorage` key cleared on the next successful navigation, so a chunk that
+is genuinely broken cannot become a reload loop. The two halves only work
+together: without the 404 the client sees a MIME-type error it cannot
+distinguish, and without the reload the 404 is merely a legible dead end.
 
 **The mic is the server's.** Both live panes open `record.Recorder` in the
 server process and stream frames over `/ws/live`, reusing `analysis_worker`
@@ -505,7 +743,8 @@ or tunings elsewhere.
 
 [gemini.py](musiccopilot/gemini.py) uses structured output — the pydantic `Solo` schema is passed
 as `response_schema`, so prompt changes must keep the schema satisfiable. Model comes from
-`GEMINI_MODEL` (default `gemini-3.5-flash`); `listening_notes` uploads the mp3 via the Files API.
+`GEMINI_MODEL` (default `gemini-3.5-flash`), except cleanup, which uses the cheaper
+`GEMINI_CLEAN_MODEL`; `listening_notes` uploads the mp3 via the Files API.
 `cli.main` seeds `np.random.seed(0)`, which also makes the synth's reverb impulse deterministic.
 `python -m musiccopilot models` lists what a given key can actually reach — `models.list()`
 can still list a model your key can no longer call (`generate_content` 404s with "no longer
@@ -531,3 +770,68 @@ forbids inventing notes or changing the phrase's contour — only merging pitch-
 fragments, dropping noise-floor grace notes, and fixing octave errors. It runs at
 `temperature=0.2` (cleanup, not composition) and is display-time only: it never writes
 `notes/<stem>.json`, so a bad cleanup is one flag away from the raw transcription.
+
+#### What a Gemini button is allowed to cost
+
+Everything else in this repo is computed locally, so these three calls are the
+entire bill, and each one is expensive for a different reason. The limits are
+in [config.py](musiccopilot/config.py) with the rest of the constants.
+
+**Thinking tokens were the dominant cost, not the model.** Nothing here set
+`thinking_config`, so every call thought on the automatic budget — which is
+what the "same 75-note cleanup measured 48s once and over 110s the next time"
+note in the Scriptum section was actually describing, and why a cleanup could
+sit for three minutes and come back `RemoteProtocolError: Server disconnected`.
+Thinking is billed as output *and* counts against `max_output_tokens`, so the
+two have to be set together: a budget that eats the ceiling truncates the JSON
+and the parse fails after you have paid for it. With `LLM_CLEAN_THINKING=512`
+the same window is ~11s on either model. Do not remove the budgets to "let it
+think about it" — a cleanup is a pass over given data, not a decision.
+
+**`clean_solo` is billed twice over, so it is a snippet operation.** The model
+is sent the window and writes it back, and the shape of the request is what
+makes size fatal rather than merely costly:
+
+| window | notes | in | out |
+|---|---|---|---|
+| `guitar solo` part | 75 | ~4.4k | ~5k |
+| whole song, `guitar` | 1438 | ~65k | ~65k |
+
+A whole song is not a bigger version of the intended request, it is about a
+hundred times the bill of it. And a whole-song window is the *default* on the
+Tabs page, because `cli._window` reads "no passage" as the first twenty
+seconds and `windowParams` therefore has to send `start=0, end=duration`
+explicitly (see the Scriptum section) — so the expensive request was one click
+on a page that had never been asked which passage it meant.
+
+`clean_solo` raises `TooLongToClean` and **the limit is enforced there**, not
+at each caller, for the same reason `app._window` calls `cli._window`: the
+browser and the terminal must not disagree about what a snippet is.
+`clean_window_cost` answers the same question without spending anything, so
+the front end can grey the button out (`clean_ok`/`clean_size` ride along on
+the tab payload) and `clean_tab` can refuse with a 400 up front rather than
+letting the user watch a job fail. `cli._llm_clean` reports the refusal and
+returns the raw notes — the tab is still worth printing.
+
+`notes_to_solonotes` **rounds**, because these numbers are sent and every digit
+is a billed token: a raw `(n.start - t0) * bps` prints as `14.341232328869047`,
+17 significant figures of a float that came off a 10ms CREPE frame. Three
+decimals of a beat is 1.5ms at 123bpm. That plus dropping `indent=2` (about a
+fifth of the tokens, and the model never reads it) halves the payload.
+
+**`listening_notes` is the one call billed by the length of the song**, not the
+size of a passage: it uploads the mp3 and Gemini charges per second of audio —
+crystallize is 6.9k input tokens before a word of prompt. It is cached in
+`llm_notes.txt` and has always been opt-in on the CLI (`analyze --llm`), but
+both web call sites hardcoded `llm: true`, so every browser analysis bought it
+without asking. It is now `settings.llmNotes`, default off, in the settings
+pane next to the transcriber. The upload is deleted afterwards — Files API
+storage expires on its own after 48h, but leaving every song ever analysed in
+the quota serves nobody.
+
+`GEMINI_CLEAN_MODEL` (default `gemini-3.5-flash-lite`) is separate from
+`GEMINI_MODEL` because cleanup is mechanical and composition is not. On
+crystallize's solo the two tiers agree closely (75 → 69 notes on lite, 75 → 64
+on flash, both merging the same jitter runs); set it to `gemini-3.5-flash` if a
+cleanup ever looks careless. `suggest_solo` keeps the full model and a real
+thinking budget — it is the one call actually being asked to decide something.

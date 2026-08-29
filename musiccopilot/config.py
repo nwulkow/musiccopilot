@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -9,9 +10,71 @@ SR = 44100                      # everything is resampled to this
 OUTDIR = "analyzed_songs"       # per-song folder lives here, next to the audio
 LEGACY_WORKDIR = ".musiccopilot"    # what OUTDIR used to be called
 
+# --- stem names ---------------------------------------------------------------
+# The six htdemucs_6s outputs are the pipeline's whole instrument vocabulary:
+# they are simultaneously wav filenames, `Song.stems` keys, `--stem` values,
+# `PITCH_RANGE` keys, `TRANSCRIBE_STEMS` and `LEAD_STEMS` entries. Separation
+# can only ever produce one of each, so name and instrument used to be the same
+# thing.
+#
+# An imported multitrack (`daw.py`) breaks that: a band has two guitarists and
+# a singer with a backing vocal, and summing them back together would throw
+# away exactly the separation that made importing worth doing. So a stem may
+# now carry a `-2` suffix, and every lookup keyed by instrument goes through
+# `base_stem` rather than the name itself - `guitar-2` is a guitar in each way
+# that matters (pitch window, tuning, claim on being a solo's lead) while
+# staying its own stem, its own notes file and its own tab.
+STEM_NAMES = ("drums", "bass", "other", "vocals", "guitar", "piano")
+
+_STEM_SUFFIX = re.compile(r"-\d+$")
+
+
+def base_stem(stem: str) -> str:
+    """The canonical instrument a stem name belongs to: `guitar-2` -> `guitar`.
+
+    Anything that is not a suffixed canonical name comes back unchanged, so
+    `mix` (what a song with no stems at all transcribes as) and any name a
+    future importer invents still resolve to themselves and fall through the
+    same `.get(name, default)` lookups they always did.
+    """
+    root = _STEM_SUFFIX.sub("", stem)
+    return root if root in STEM_NAMES else stem
+
 # --- Gemini -----------------------------------------------------------------
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_KEY_ENV = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+
+# Cleaning a transcription is mechanical - merge pitch-jitter fragments, drop
+# noise-floor grace notes, fix octaves - and it runs at temperature 0.2 for
+# that reason. It does not need the reasoning tier that writing a solo does,
+# so it gets the cheap model. `GEMINI_CLEAN_MODEL=gemini-3.5-flash` puts it
+# back on the composing model if a cleanup ever looks careless.
+GEMINI_CLEAN_MODEL = os.getenv("GEMINI_CLEAN_MODEL", "gemini-3.5-flash-lite")
+
+# --- what one Gemini button is allowed to cost ------------------------------
+# `clean_solo` is the expensive shape: it echoes its input back, so the window
+# is billed twice - once in, once out - and thinking tokens are billed as
+# output on top. A whole-song window is not a bigger version of the intended
+# request, it is a different request: crystallize's guitar stem is 1438 notes
+# over the whole song (~65k tokens in, as many again out) against 75 notes for
+# the guitar solo it was built for (~1.9k). These caps are what keep the
+# button a snippet button; `_window`'s own "no passage means the whole song"
+# on the web side is what made overshooting the default.
+LLM_CLEAN_MAX_NOTES = int(os.getenv("MUSICCOPILOT_CLEAN_MAX_NOTES", "250"))
+LLM_CLEAN_MAX_SECONDS = float(os.getenv("MUSICCOPILOT_CLEAN_MAX_SECONDS", "75"))
+
+# Thinking tokens are billed as output and count against `max_output_tokens`,
+# so the two knobs have to be set together: a budget that eats the ceiling
+# truncates the JSON and the parse fails after you have paid for it. Cleanup
+# gets a small fixed budget (it is a pass over given data, not a decision);
+# composition keeps a real one.
+LLM_CLEAN_THINKING = 512
+LLM_SOLO_THINKING = 4096
+# Ceilings, not targets. Nothing here has a natural stopping point the model
+# is obliged to respect, and an unbounded response is an unbounded bill.
+LLM_CLEAN_MAX_OUTPUT = 16000      # ~35 tokens/note at the 250-note cap, + budget
+LLM_SOLO_MAX_OUTPUT = 12000
+LLM_NOTES_MAX_OUTPUT = 2048       # the prompt asks for ~250 words
 
 # --- pitch / notes ----------------------------------------------------------
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -29,6 +92,17 @@ TUNINGS = {
 }
 STRING_LABELS = {"guitar": ["E", "A", "D", "G", "B", "e"], "bass": ["E", "A", "D", "G"]}
 MAX_FRET = 22
+
+
+def fretboard_for(stem: str) -> str | None:
+    """The tuning a stem should be read on, or None if it has no fretboard.
+
+    A fretboard is a lie for a stem with no strings (piano, vocals, demucs'
+    catch-all "other"), which is why callers branch on this to render a staff
+    instead - see CLAUDE.md, "Stems without a fretboard get a staff".
+    """
+    root = base_stem(stem)
+    return root if root in TUNINGS else None
 
 # Frequency windows used to constrain note transcription per instrument.
 PITCH_RANGE = {

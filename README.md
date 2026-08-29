@@ -18,6 +18,13 @@ export GEMINI_API_KEY=...      # your Gemini key
 ## Use
 
 ```bash
+# already have the multitrack? import it instead of separating it.
+# --dry-run first: it prints what each track will become, and writes nothing
+python -m musiccopilot import "Band Practice.band" --dry-run
+python -m musiccopilot import "Band Practice.band" --analyze
+python -m musiccopilot import ./bandlab-stems --map "Acoustic=guitar-2"
+python -m musiccopilot tracks song.wav --map "Track3_VoiceAudio=vocals"
+
 # one slow pass (stems + chords + notes + lyrics + form), cached per song
 python -m musiccopilot analyze song.mp3 --llm
 
@@ -51,6 +58,12 @@ python -m musiccopilot tab song.mp3 --part "guitar solo" --stem guitar --follow
 python -m musiccopilot tab song.mp3 --stem guitar --bars 17-24 \
     --follow --minus-stem --speed 0.75 --count-in 4
 
+# which note transcriber this install can run, and re-read one song's notes
+# with a different one (cheap: stems, chords and form are left alone)
+python -m musiccopilot transcribers
+python -m musiccopilot transcribe song.mp3 --backend crepe --stem guitar
+python -m musiccopilot analyze song.mp3 --backend crepe
+
 # ask Gemini for a solo over the solo section, hear it over the real backing
 # track (the song minus the guitar stem)
 python -m musiccopilot solo song.mp3 --prompt "slow bluesy, lots of bends, build to a scream" --play
@@ -81,6 +94,7 @@ or skip them entirely with `--part chorus2`.
 | step | module | approach |
 |---|---|---|
 | stems | `audio.py` | Demucs `htdemucs_6s` → drums, bass, other, vocals, guitar, piano |
+| import | `daw.py` | a GarageBand `.band` or a folder of stems → the same six names, skipping Demucs |
 | tempo/beats | `analysis.py` | librosa beat tracking + onset-energy downbeat phase |
 | key | `analysis.py` | Krumhansl–Kessler profile correlation |
 | chords | `analysis.py` | beat-synced CQT chroma → 97 templates → Viterbi smoothing |
@@ -88,11 +102,68 @@ or skip them entirely with `--part chorus2`.
 | structure | `analysis.py` | agglomerative segmentation + KMeans labelling (A/B/C) |
 | patterns | `analysis.py` | repeated n-chord loop mining, riff-density windows |
 | chart | `chart.py` | one chord loop per role, plus only what differs in each repeat |
-| notes | `notes.py` | Basic Pitch (polyphonic), pYIN fallback (mono) |
+| notes | `notes.py` | pick one: Basic Pitch (polyphonic, default), CREPE (mono, keeps bends), pYIN (mono, lightest) |
 | lyrics | `lyrics.py` | Whisper on the isolated vocal stem |
 | tabs | `tabs.py` | Viterbi over fret positions minimising hand travel |
 | solos | `gemini.py` | Gemini structured JSON output → notes → tab + MIDI + audio |
 | sound | `synth.py` | additive osc on a pitch curve (bends/slides/vibrato) + amp sim |
+
+## Importing from GarageBand and BandLab
+
+If the band already recorded the parts separately, there is nothing to separate.
+`import` writes those tracks in as the stems and everything downstream — chords,
+form, tabs, play-along, the web app — runs exactly as it does on a mix, minus the
+slowest and least reliable stage. Two guitarists stay two guitarists: they become
+`guitar` and `guitar-2`, each with its own notes and its own tab.
+
+**BandLab** — in the Studio, Project → Download → Tracks (WAV). The tracks come
+down one at a time, so collect them into a folder and point `import` at it (a
+zip of that folder works too). Nothing is guessed. In the web app they can be
+dropped straight onto the BandLab tab of **Import multitrack**, which is the
+only door that uploads: BandLab has no public API to pull a project from, so
+the download *is* the handover, and it happens in whatever browser you were in.
+
+**GarageBand** — point `import` at the `.band` project itself. On current macOS
+`~/Music/GarageBand` is TCC-protected, and the permission is filed under the app
+that *launched* Scriptum (your terminal, or VS Code) rather than under Scriptum
+— which is why "grant Scriptum access" is not a thing you can do. Either give
+that app Full Disk Access, or drag the project to `~/Downloads` in Finder and
+open the copy, which needs no permission at all. GarageBand has no
+stem export (the official route is soloing each track and exporting it, one at a
+time), but the project is a folder and the recorded takes are inside it, so this
+reads them straight out. It assumes every region starts at bar 1, which is true
+of a practice-room take — one pass, everyone playing through — and not true of an
+edited project. Bounce the mix in GarageBand too if you want the band's own fader
+balance; otherwise the stems are summed.
+
+Track names are matched to instruments (in English and German), and `--dry-run`
+shows the whole mapping before anything is written:
+
+```
+Bass DI         ->  bass        (matched 'bass')
+Drum Kit OH     ->  drums       (matched 'drum')
+Gesang          ->  vocals      (matched 'gesang')
+Gtr Nik         ->  guitar      (matched 'gtr')
+Rhythm Gitarre  ->  guitar-2    (matched 'gitarre'; guitar was taken)
+```
+
+Fix any row with `--map "Rhythm Gitarre=piano"`. Imported stems are never
+re-separated, `--force` included.
+
+A row can also be corrected **after** the import, which is the case that
+matters when the mistake is only visible in the result — a vocal track read as
+a guitar looks like an ordinary mapping until the Lyrics tab comes back empty:
+
+```bash
+python -m musiccopilot tracks song.wav                     # what each track became
+python -m musiccopilot tracks song.wav --map "Track3=vocals"
+```
+
+The stems are renamed in place (the audio was always right, only the labels on
+it were wrong) and only what the labels were load-bearing for is read again — a
+change of instrument re-does the chords, notes and lyrics; swapping two
+guitarists' numbers re-does only the form. In Scriptum it is the **Which track
+is which** button beside the song title.
 
 ## How the form is worked out
 
@@ -118,6 +189,14 @@ or skip them entirely with `--part chorus2`.
 
 ## Tuning the results
 
+- Notes wrong? Try another transcriber. **Basic Pitch** (the default) hears
+  chords, so it is right for rhythm parts and wrong for a solo, where it
+  invents extra pitches and chops a bend into steps. **CREPE** tracks one
+  continuous pitch, so it reads bends, slides and vibrato as techniques —
+  best for solos, bass and vocal melodies, wrong for anything chordal.
+  **pYIN** is the lightest and hears neither. Choose in Scriptum's Settings
+  pane, or with `--backend`; `transcribe` re-reads one song without redoing
+  the slow separation. (Solos are re-read monophonically either way.)
 - Form off? The knobs are in `FORM` in `config.py` - `min_bars`, `k_range`
   (how many kinds of material to look for), `vocal_threshold`, `solo_density`.
 - Chords sound smeared? `detect_chords(..., self_prob=0.7)` for faster changes.
@@ -155,7 +234,8 @@ What is in it:
   range, or the whole song), as a real fretboard for guitar and bass and as
   engraved sheet music for anything without strings: grand staff, key
   signature, beams, rests, ties, chord symbols. Guitar and bass can be read
-  either way. "Clean up" runs the Gemini pass from `--llm-clean`.
+  either way. "Clean up" runs the Gemini pass from `--llm-clean` — pick a part
+  or a bar range first, it is capped to a passage rather than a whole song.
 - **Play along** — several instruments at once, tabs and sheet music side by
   side, scrolling under one cursor, with speed, count-in, loop, and
   drop-your-instrument-out-of-the-mix. Drag the progress bar and every part
@@ -203,5 +283,10 @@ Slow work runs as a job on a worker thread and reports progress over SSE, since
   verse/chorus convention gets `Section A/B` names and honest chord loops.
 - Basic Pitch on a distorted guitar stem picks up harmonics as extra notes;
   riff tabs need a human eye.
+- Importing a `.band` assumes each track's audio starts at bar 1: GarageBand
+  keeps region positions in an undocumented file this cannot read. Right for a
+  practice-room take, wrong for an edited project — export the stems for those.
+  Software-instrument tracks leave no audio in the project and need bouncing
+  first. A track with several regions keeps the longest and says so.
 - The synth is a stylised approximation, not a sampled guitar. Load the exported
   `.mid` into a DAW with a real guitar VST if you want the good sound.

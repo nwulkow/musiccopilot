@@ -11,9 +11,9 @@ import re
 from pathlib import Path
 
 from . import notes as nt
-from .config import TUNINGS
+from .config import fretboard_for
 from .form import parse_chord, reference_part, transpose_loop
-from .tabs import StaffLayout, chord_shape, pick_instrument, tab_for
+from .tabs import StaffLayout, chord_shape, tab_for
 
 SEMITONE_WORDS = {1: "a half step", 2: "a whole step", 3: "three half steps",
                   4: "two whole steps", 5: "a fourth", 7: "a fifth"}
@@ -72,8 +72,7 @@ def _tab_of(song, part, max_bars: int, subdiv: int = 4) -> str:
     where = (f"bars {part.bar}-{part.bar + max_bars - 1}" if end < part.end
              else f"bars {part.bar}-{part.bar + part.bars - 1}")
     chords = [c for c in a.chords if c.end > part.start and c.start < end]
-    if stem in TUNINGS or stem == "guitar":
-        instrument = "bass" if stem == "bass" else "guitar" if stem == "guitar" else pick_instrument(window)
+    if (instrument := fretboard_for(stem)):
         body = tab_for(window, instrument, tempo=a.tempo, t0=part.start,
                        beats_per_bar=a.beats_per_bar, subdiv=subdiv, max_width=84,
                        first_bar=part.bar, chords=chords)

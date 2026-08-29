@@ -12,17 +12,20 @@ import asyncio
 import json
 import os
 import shutil
+import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from fastapi import (Body, FastAPI, HTTPException, UploadFile, WebSocket,
-                     WebSocketDisconnect)
+from fastapi import (Body, FastAPI, File, Form, HTTPException, UploadFile,
+                     WebSocket, WebSocketDisconnect)
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from musiccopilot import cli, notes as nt, report
-from musiccopilot.config import SR, TUNINGS
+from musiccopilot.config import (LLM_CLEAN_MAX_NOTES, LLM_CLEAN_MAX_SECONDS, SR,
+                                 STEM_NAMES, base_stem, fretboard_for, workdir_for)
 from musiccopilot.pipeline import TRANSCRIBE_STEMS, Song
 
 from . import library, live, serialize
@@ -89,9 +92,8 @@ def _layout_for(song, stem: str, start: float, end: float, *, subdiv: int,
                                    pick_instrument)
 
     a = song.analysis
-    fretted_stem = stem in TUNINGS or stem == "guitar"
-    instrument = ("bass" if stem == "bass" else
-                  "guitar" if stem == "guitar" else pick_instrument(window))
+    fretted_stem = fretboard_for(stem)
+    instrument = fretted_stem or pick_instrument(window)
     common = dict(
         tempo=a.tempo, t0=start, beats_per_bar=a.beats_per_bar, subdiv=subdiv,
         first_bar=report.bar_number(song, start),
@@ -114,14 +116,28 @@ class _SPAFiles(StaticFiles):
     rather than the 404 handler. Anything under /api or /ws is a real miss
     and is left alone, so a mistyped endpoint still fails as an endpoint
     instead of quietly returning HTML.
+
+    A built asset is never a client route either, and that exclusion is not
+    cosmetic. Vite fingerprints every lazy view into its own chunk, so a tab
+    left open across a rebuild asks for a chunk name that no longer exists -
+    and answering it with the shell hands the browser HTML where it asked for
+    a JavaScript module. The import rejects, vue-router abandons the
+    navigation, and the link is dead for the life of that tab with nothing in
+    the network log but a 200. A real 404 is what lets the client notice it is
+    out of date and reload (`main.js`, `router.onError`).
     """
+
+    #: Suffixes that only ever name a built file, so a miss there is a miss.
+    ASSETS = (".js", ".mjs", ".css", ".map", ".woff", ".woff2", ".ttf", ".ico")
 
     async def get_response(self, path: str, scope):
         """Serve the file, or the SPA shell when the path is a client route."""
         try:
             return await super().get_response(path, scope)
         except StarletteHTTPException as exc:
-            if exc.status_code != 404 or path.startswith(("api", "ws")):
+            if (exc.status_code != 404
+                    or path.startswith(("api", "ws", "assets/"))
+                    or path.endswith(self.ASSETS)):
                 raise
             return await super().get_response("index.html", scope)
 
@@ -147,7 +163,22 @@ def create_app() -> FastAPI:
             has_key = False
         return {"ok": True, "mic": mic, "gemini": has_key,
                 "library": str(library.library_root()),
-                "stems": TRANSCRIBE_STEMS}
+                "stems": TRANSCRIBE_STEMS,
+                # The cleanup cap, so the settings pane can state it without
+                # keeping its own copy of a number that lives in Python.
+                "clean_limit": {"max_notes": LLM_CLEAN_MAX_NOTES,
+                                "max_seconds": LLM_CLEAN_MAX_SECONDS}}
+
+    @app.get("/api/transcribers")
+    def get_transcribers() -> dict:
+        """The note transcribers this install can run, for the settings pane.
+
+        Availability is reported rather than assumed: every backend but pYIN
+        is an optional dependency, and an engine that cannot import should be
+        explained in the settings list instead of failing when a song is
+        analysed with it.
+        """
+        return {"backends": nt.backend_status(), "default": nt.DEFAULT_BACKEND}
 
     @app.get("/api/library")
     def get_library() -> list[dict]:
@@ -166,6 +197,191 @@ def create_app() -> FastAPI:
         with dest.open("wb") as fh:
             shutil.copyfileobj(file.file, fh)
         return library.entry(dest)
+
+    # -------------------------------------------------------------------- daw
+    #
+    # Scriptum runs on the machine GarageBand is open on, so importing a
+    # project is a question the server answers about its own filesystem - the
+    # browser never uploads a `.band`, which it could not do anyway: a project
+    # is a *package*, and a file input hands back either nothing or an
+    # unordered pile of its insides.
+    @app.get("/api/daw/garageband")
+    def garageband() -> dict:
+        """What GarageBand has open, what else is lying around, and whether
+        this process is actually allowed to read any of it."""
+        from musiccopilot import daw
+
+        def row(p) -> dict:
+            ok, hint = daw.readable(p)
+            return {"path": str(p), "name": p.stem, "readable": ok, "hint": hint}
+
+        open_now = [row(p) for p in daw.open_projects()]
+        recent = [row(p) for p in daw.recent_projects()
+                  if not any(r["path"] == str(p) for r in open_now)]
+        rows = open_now + recent
+        return {
+            "open": open_now,
+            "recent": recent,
+            # One blocked project and every project is blocked - it is a folder
+            # permission, not a per-file one - so the client can show the fix
+            # once at the top instead of on every row.
+            "blocked": bool(rows) and all(not r["readable"] for r in rows),
+            "hint": next((r["hint"] for r in rows if r["hint"]), ""),
+            # Whose permission it is. macOS files the toggle under the app that
+            # launched Scriptum, so a panel that says "grant Scriptum access"
+            # is sending someone to look for a row that cannot exist.
+            "app": daw.responsible_app(),
+        }
+
+    @app.post("/api/daw/reveal")
+    def daw_reveal(body: dict = Body(...)) -> dict:
+        """Show a project in Finder, blocked or not.
+
+        The way out of a TCC block is to drag the project somewhere unprotected,
+        and that drag is the one thing Scriptum cannot do on anyone's behalf -
+        it may not copy what it may not read. Opening a Finder window on it is
+        the most the app can contribute, and `open` needs no permission of its
+        own because Finder does the opening.
+        """
+        from musiccopilot import daw
+        src = Path((body.get("path") or "").strip()).expanduser()
+        if not src.exists() or not (src.suffix.lower() == ".band" or src.is_dir()):
+            raise HTTPException(400, "not a project or folder on this Mac")
+        daw.reveal(src)
+        return {"revealed": str(src)}
+
+    @app.post("/api/daw/upload")
+    async def daw_upload(files: list[UploadFile] = File(...),
+                         name: str = Form("")) -> dict:
+        """Take exported tracks from the browser and stage them as a folder.
+
+        The other doors are about the *server's* filesystem, which is right when
+        Scriptum runs on the machine the session is on. BandLab is the case
+        where it is not: the tracks come out of a browser one download at a
+        time, on whatever machine that browser was on. So they are uploaded, and
+        land in a staging folder that `read_session` then reads exactly as if
+        someone had pointed at it - the import path does not learn a new shape.
+
+        A single zip is passed through as a zip rather than unpacked here:
+        `read_session` already knows how to, and doing it twice would mean two
+        guesses at the same wrapper folders.
+        """
+        from musiccopilot import daw
+        allowed = daw.AUDIO_SUFFIXES | {".zip"}
+        keep = []
+        for f in files:
+            base = Path(f.filename or "").name
+            # A folder upload sends everything else in the folder too; a stems
+            # folder with a PDF and a .DS_Store in it is not an error.
+            if base and not base.startswith(".") and Path(base).suffix.lower() in allowed:
+                keep.append((base, f))
+        if not keep:
+            raise HTTPException(400, "no audio files in that - BandLab's "
+                                     "Download > Tracks gives WAV or M4A")
+
+        root = library.library_root() / ".imports"
+        root.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - 24 * 3600
+        for old in root.iterdir():      # staging is scaffolding, not storage
+            if old.is_dir() and old.stat().st_mtime < cutoff:
+                shutil.rmtree(old, ignore_errors=True)
+
+        # mkdtemp rather than a name of our own: two uploads a second apart
+        # would otherwise collide, and merging them would import the tracks of
+        # whichever attempt was abandoned along with the ones that were not.
+        dest = Path(tempfile.mkdtemp(prefix=f"{daw.slug(name or keep[0][0])}-",
+                                     dir=root))
+        for base, f in keep:
+            with (dest / base).open("wb") as fh:
+                shutil.copyfileobj(f.file, fh)
+        one_zip = len(keep) == 1 and keep[0][0].lower().endswith(".zip")
+        return {"path": str(dest / keep[0][0] if one_zip else dest),
+                "files": len(keep)}
+
+    @app.post("/api/daw/browse")
+    def daw_browse(body: dict = Body(default={})) -> dict:
+        """Open a native macOS file picker - on the server's own screen.
+
+        A `.band` is a *package*: a browser file input either refuses it or
+        hands back a pile of its insides with no folder structure, so "open
+        from file" cannot be an upload. It can be a real Finder dialog,
+        because the machine running Scriptum is the machine with the project
+        on it. Useless when Scriptum is being driven from a phone, which is
+        why the picker is an *alternative* to the path field rather than the
+        only way in - the client keeps both.
+        """
+        import subprocess
+        kind = body.get("kind") or "band"
+        prompt = ("Choose a GarageBand project" if kind == "band"
+                  else "Choose the folder of exported stems")
+        script = (f'choose file with prompt "{prompt}" of type {{"band"}}'
+                  if kind == "band" else f'choose folder with prompt "{prompt}"')
+        try:
+            p = subprocess.run(["osascript", "-e", f'POSIX path of ({script})'],
+                               capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(408, "the file picker was left open too long")
+        except OSError as exc:
+            raise HTTPException(500, f"cannot open a file picker here: {exc}")
+        if p.returncode != 0:
+            err = p.stderr.strip()
+            if "-128" in err:                       # the user pressed Cancel
+                return {"path": ""}
+            raise HTTPException(500, err or "the file picker failed")
+        return {"path": p.stdout.strip().rstrip("/")}
+
+    @app.post("/api/daw/preview")
+    def daw_preview(body: dict = Body(...)) -> dict:
+        """The track -> stem mapping for a session, computed but not written.
+
+        The browser's half of `--dry-run`: the guesses are good, not perfect,
+        and the moment to fix "which of these two is the rhythm guitar" is
+        before a five-minute analysis rather than after it.
+        """
+        from musiccopilot import daw
+        src = (body.get("path") or "").strip()
+        if not src:
+            raise HTTPException(400, "no path")
+        ok, hint = daw.readable(src)
+        if not ok:
+            raise HTTPException(403, hint)
+        try:
+            session = daw.assign(daw.read_session(src), body.get("map") or {})
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return serialize.session_json(session)
+
+    @app.post("/api/daw/import")
+    def daw_import(body: dict = Body(...)) -> dict:
+        """Import a session, then analyse it - as one job, since importing
+        without analysing leaves a song the rest of the app cannot open."""
+        from musiccopilot import daw
+        src = (body.get("path") or "").strip()
+        if not src:
+            raise HTTPException(400, "no path")
+        ok, hint = daw.readable(src)
+        if not ok:
+            raise HTTPException(403, hint)
+        try:
+            session = daw.assign(daw.read_session(src), body.get("map") or {})
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        name = body.get("name") or session.source.stem
+        song_id = daw.slug(name)
+        backend = body.get("backend")
+
+        def run(job) -> dict:
+            for w in session.warnings:
+                job.log(f"! {w}")
+            path = daw.import_session(session, name=name,
+                                      out=library.library_root(), log=job.log)
+            job.log(f"imported {len(session.tracks)} tracks - no separation needed")
+            from musiccopilot import chart as chart_mod
+            chart_mod.write(Song.open(path).run(backend=backend, log=job.log))
+            return {"song": path.stem}
+
+        return JOBS.start("import", song_id, run).snapshot()
 
     @app.delete("/api/library/{song_id}")
     def delete_song(song_id: str, cache: bool = True) -> dict:
@@ -196,7 +412,12 @@ def create_app() -> FastAPI:
             "form": serialize.form_json(song.form) if song.form else None,
             "lyrics": [serialize.line_json(l) for l in song.lyrics],
             "stems": sorted(song.stems),
+            # Present only for an imported multitrack. The client uses it to
+            # stop promising a stem-separation pass that will not run, and to
+            # say which of the band's tracks each stem actually is.
+            "sources": song.sources or None,
             "note_stems": {s: len(ns) for s, ns in sorted(song.notes.items())},
+            "note_backends": dict(sorted(song.note_backends.items())),
             "llm_notes": song.llm_notes,
             "chart": (work / "chart.md").read_text() if (work / "chart.md").exists() else "",
         }
@@ -219,6 +440,7 @@ def create_app() -> FastAPI:
                 force=opts.get("force", False),
                 whisper_size=opts.get("whisper", "base"),
                 device=opts.get("device") or None,
+                backend=opts.get("backend") or None,
                 log=job.log)
             if opts.get("stem_snippets"):
                 job.log("• cutting per-instrument snippets…")
@@ -230,6 +452,87 @@ def create_app() -> FastAPI:
             return {"song": song_id}
 
         return JOBS.start("analyze", song_id, work).snapshot()
+
+    @app.post("/api/songs/{song_id}/transcribe")
+    def retranscribe(song_id: str, body: dict = Body(default={})) -> dict:
+        """Re-read a song's notes with a different transcriber.
+
+        Separate from /analyze because it is the cheap half of the pipeline:
+        the stems, chords, lyrics and form are already right and are left
+        alone, so changing engine costs one transcription pass instead of the
+        whole slow run. Like analysis it is a job - a stem is tens of seconds,
+        not a request - and the one-per-song rule keeps it from racing an
+        analysis over the same cache files.
+        """
+        song = _song(song_id)
+        backend = body.get("backend") or nt.DEFAULT_BACKEND
+        if backend not in nt.BACKENDS:
+            raise HTTPException(400, f"unknown transcriber {backend!r}")
+        stems, force, path = body.get("stems") or None, bool(body.get("force")), song.path
+
+        def work(job) -> dict:
+            """Re-transcribe on a worker thread, logging each stem."""
+            fresh = Song.open(path)
+            try:
+                changed = fresh.retranscribe(backend, stems=stems, force=force,
+                                             log=job.log)
+            except ValueError as exc:              # an unknown stem name
+                raise HTTPException(400, str(exc)) from exc
+            job.log("done" if changed else "already read with that engine")
+            return {"song": song_id, "backend": backend, "stems": sorted(changed)}
+
+        return JOBS.start("transcribe", song_id, work).snapshot()
+
+    @app.post("/api/songs/{song_id}/tracks")
+    def reassign_tracks(song_id: str, body: dict = Body(...)) -> dict:
+        """Point an imported song's tracks at different instruments.
+
+        The mapping is checked before the import, but a wrong row is not always
+        visible until the analysis comes back - a vocal track labelled `guitar`
+        shows up as an empty Lyrics tab, not as an error. Re-importing to fix
+        one row would mean handing over the whole multitrack again, so the
+        stems are relabelled in place and only what the labels were
+        load-bearing for is read again (`daw.reassign`).
+        """
+        from musiccopilot import daw
+        path = library.find(song_id)
+        if path is None:
+            raise HTTPException(404, f"no song {song_id!r}")
+        mapping = body.get("map") or {}
+        if not mapping:
+            raise HTTPException(400, "no tracks to reassign")
+        # Checked here as well as inside `reassign`, because a bad row is an
+        # argument error and belongs in the response - the job is for the
+        # minutes of work that follow, and a 400 should not have to be dug out
+        # of a failed job's transcript. The work itself stays in the job: it
+        # renames files the pipeline reads, and `JOBS.start` is what keeps it
+        # from doing that underneath a running analysis.
+        sources = Song.open(path).sources
+        if not sources:
+            raise HTTPException(400, f"{path.name} was separated, not imported - "
+                                     "there are no tracks to reassign")
+        known = {t["name"].lower() for t in sources.get("tracks") or []}
+        for name, stem in mapping.items():
+            if str(name).lower() not in known:
+                raise HTTPException(400, f"no track named {name!r}")
+            if base_stem(stem) not in STEM_NAMES:
+                raise HTTPException(400, f"unknown stem {stem!r}")
+        backend = body.get("backend")
+
+        def work(job) -> dict:
+            job.log("• relabelling the imported tracks…")
+            done = daw.reassign(workdir_for(path), mapping, log=job.log)
+            if not done["moves"]:
+                job.log("nothing to change")
+                return {"song": song_id, **done}
+            job.log(f"• re-reading {', '.join(done['recompute'])}…")
+            song = Song.open(path).run(backend=backend, log=job.log)
+            from musiccopilot import chart as chart_mod
+            chart_mod.write(song)
+            job.log("done")
+            return {"song": song_id, **done}
+
+        return JOBS.start("reassign", song_id, work).snapshot()
 
     @app.get("/api/songs/{song_id}/chart")
     def get_chart(song_id: str) -> dict:
@@ -269,11 +572,22 @@ def create_app() -> FastAPI:
                                       "have": sorted(song.notes)})
         t_start, t_end, title = _window(song, part, bars, start, end)
         window = nt.in_window(ns, t_start, t_end)
+        from musiccopilot.gemini import clean_window_cost
+        # Whether the cleanup button applies to *this* window is a fact about
+        # the limit in `musiccopilot.config`, so it is answered here and sent
+        # along - the client greys the button out rather than keeping its own
+        # copy of the numbers and drifting from them.
+        can_clean, n_win, secs_win = clean_window_cost(window, t_start, t_end)
         cleaned = None
         if clean and window:
-            from musiccopilot.gemini import clean_solo, solo_to_notes
+            from musiccopilot.gemini import TooLongToClean, clean_solo, solo_to_notes
             before = len(window)
-            res = clean_solo(window, song.analysis, t_start, t_end)
+            try:
+                res = clean_solo(window, song.analysis, t_start, t_end)
+            except TooLongToClean as exc:
+                raise HTTPException(400, {"error": "window_too_long",
+                                          "detail": str(exc), "notes": n_win,
+                                          "seconds": round(secs_win, 1)}) from exc
             window = solo_to_notes(res, song.analysis.tempo, t0=t_start)
             cleaned = {"before": before, "after": len(window),
                        "changes": res.changes}
@@ -283,6 +597,10 @@ def create_app() -> FastAPI:
         out["heading"] = report.window_title(song, t_start, t_end,
                                              f"{title} · " if title else "")
         out["llm_clean"] = cleaned
+        out["clean_ok"] = can_clean
+        out["clean_size"] = {"notes": n_win, "seconds": round(secs_win, 1),
+                             "max_notes": LLM_CLEAN_MAX_NOTES,
+                             "max_seconds": LLM_CLEAN_MAX_SECONDS}
         out["notes"] = [serialize.note_json(n) for n in window]
         if part and song.form:
             p = song.part(part)
@@ -341,14 +659,40 @@ def create_app() -> FastAPI:
     def clean_tab(song_id: str, body: dict = Body(default={})) -> dict:
         """Ask Gemini to declutter a transcribed passage, as a job.
 
-        This is a job rather than a query flag because the call is slow -
-        a 75-note solo window measures around 50s, past what a browser will
-        reliably hold a GET open for, and longer passages are worse. Like the CLI's
-        `--llm-clean` it is display-time only: nothing is written back to
-        `notes/<stem>.json`, so a bad cleanup costs one re-request.
+        This is a job rather than a query flag because the call is slow - a
+        75-note solo window measures around a minute, past what a browser will
+        reliably hold a GET open for. Like the CLI's `--llm-clean` it is
+        display-time only: nothing is written back to `notes/<stem>.json`, so a
+        bad cleanup costs one re-request.
+
+        It is also a **snippet** operation. The default window on the Tabs page
+        is the whole song (`windowParams` has to say so; see CLAUDE.md), and on
+        crystallize's guitar stem that is 1438 notes - which the model is asked
+        to read *and* write back, for something like a hundred times the cost of
+        the guitar solo the button exists for. `clean_window_cost` is checked
+        here so that request is a 400 the page can explain.
         """
         song = _song(song_id)
         stem = body.get("stem", "guitar")
+
+        # Check the window before spending a job on it. `clean_solo` enforces
+        # the same limit itself, but a request that is going to be refused
+        # should be refused now, as a 400 the button can explain, rather than
+        # as a job the user watches and then finds failed.
+        from musiccopilot.gemini import clean_window_cost
+        ns = song.notes.get(stem) or []
+        t0, t1, _ = _window(song, body.get("part"), body.get("bars"),
+                            body.get("start"), body.get("end"))
+        ok, n_win, secs_win = clean_window_cost(nt.in_window(ns, t0, t1), t0, t1)
+        if not ok:
+            raise HTTPException(400, {
+                "error": "window_too_long", "notes": n_win,
+                "seconds": round(secs_win, 1), "max_notes": LLM_CLEAN_MAX_NOTES,
+                "max_seconds": LLM_CLEAN_MAX_SECONDS,
+                "detail": (f"{n_win} notes over {secs_win:.0f}s is past what cleanup "
+                           f"is allowed to cost. Pick a part or a bar range "
+                           f"(up to {LLM_CLEAN_MAX_NOTES} notes / "
+                           f"{LLM_CLEAN_MAX_SECONDS:.0f}s) and clean that.")})
 
         def work(job) -> dict:
             """Run the cleanup and lay the result out."""

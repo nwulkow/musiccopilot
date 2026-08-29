@@ -2,6 +2,8 @@
 import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, followJob, bytes } from '../api'
+import { chosenTranscriber, settings, useTranscribers } from '../composables/useSettings'
+import ImportPanel from '../components/ImportPanel.vue'
 
 const router = useRouter()
 const songs = ref([])
@@ -26,7 +28,7 @@ async function refresh() {
 async function attach() {
   try {
     for (const j of await api.jobs()) {
-      if (j.kind === 'analyze') watchJob(j.song, j)
+      if (['analyze', 'transcribe', 'import', 'reassign'].includes(j.kind)) watchJob(j.song, j)
     }
   } catch { /* no jobs endpoint yet is not an error worth showing */ }
 }
@@ -37,6 +39,10 @@ function watchJob(songId, job) {
     onLine: (line) => {
       const j = jobs.value[songId]
       if (j) jobs.value = { ...jobs.value, [songId]: { ...j, lines: [...j.lines, line] } }
+      // An import creates the song part-way through its own job, so the row it
+      // reports into does not exist when the job starts. Re-listing as it logs
+      // is what makes the card appear rather than the progress going nowhere.
+      if (job.kind === 'import') refresh()
     },
     onEnd: (snap) => {
       jobs.value = { ...jobs.value, [songId]: { ...snap } }
@@ -52,9 +58,13 @@ function watchJob(songId, job) {
   }))
 }
 
+useTranscribers()
+
 async function analyze(song, opts = {}) {
   try {
-    const job = await api.analyze(song.id, { llm: true, ...opts })
+    const job = await api.analyze(song.id,
+                                  { llm: settings.llmNotes, backend: chosenTranscriber(),
+                                    ...opts })
     watchJob(song.id, job)
   } catch (e) { err.value = e.message }
 }
@@ -73,6 +83,13 @@ function onDrop(e) {
   dragging.value = false
   const file = e.dataTransfer?.files?.[0]
   if (file) upload(file)
+}
+
+/** An import job is keyed by the song id it is about to create, so it can be
+ *  followed exactly like an analysis - the row appears once the import lands. */
+function onImport(job) {
+  watchJob(job.song, job)
+  refresh()
 }
 
 async function remove(song) {
@@ -98,9 +115,12 @@ const empty = computed(() => !loading.value && !songs.value.length)
         <h1 class="title">Library</h1>
         <p class="muted sub">Drop a song in, and Scriptum works out what it is made of.</p>
       </div>
-      <button class="btn btn-primary" @click="fileInput.click()">
-        <span>＋</span> Add song
-      </button>
+      <div class="actions">
+        <ImportPanel @started="onImport" @error="err = $event" />
+        <button class="btn btn-primary" @click="fileInput.click()">
+          <span>＋</span> Add song
+        </button>
+      </div>
       <input
         ref="fileInput" type="file" hidden
         accept=".mp3,.wav,.flac,.m4a,.aac,.ogg,.opus,.aiff,.aif"
@@ -194,6 +214,7 @@ const empty = computed(() => !loading.value && !songs.value.length)
 .wrap { padding: 26px 30px 60px; max-width: 1180px; }
 
 .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+.actions { display: flex; align-items: center; gap: 8px; position: relative; }
 .title { font-family: var(--font-display); font-size: 30px; }
 .sub { margin: 3px 0 0; font-size: 13.5px; }
 

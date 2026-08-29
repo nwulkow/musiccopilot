@@ -7,7 +7,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .config import GEMINI_MODEL, gemini_api_key
+from .config import (GEMINI_CLEAN_MODEL, GEMINI_MODEL, LLM_CLEAN_MAX_NOTES,
+                     LLM_CLEAN_MAX_OUTPUT, LLM_CLEAN_MAX_SECONDS,
+                     LLM_CLEAN_THINKING, LLM_NOTES_MAX_OUTPUT,
+                     LLM_SOLO_MAX_OUTPUT, LLM_SOLO_THINKING, gemini_api_key)
 from .notes import Note
 
 TECHNIQUES = Literal["normal", "bend", "slide", "hammer", "pull", "vibrato", "palm_mute"]
@@ -104,7 +107,26 @@ def _config(**kw):
     from google.genai import types
     kw.setdefault("automatic_function_calling",
                   types.AutomaticFunctionCallingConfig(disable=True))
+    if (budget := kw.pop("thinking_budget", None)) is not None:
+        kw["thinking_config"] = types.ThinkingConfig(thinking_budget=budget)
     return types.GenerateContentConfig(**kw)
+
+
+class TooLongToClean(ValueError):
+    """Raised when a cleanup window is past what the button is allowed to cost.
+
+    Carries the measured size so a caller can say *how far* over the request
+    is - "the whole song" and "one bar too many" want different advice.
+    """
+
+    def __init__(self, notes: int, seconds: float):
+        self.notes, self.seconds = notes, seconds
+        over = ("the whole song" if notes > 4 * LLM_CLEAN_MAX_NOTES else "this passage")
+        super().__init__(
+            f"{over} is too long to clean: {notes} notes over {seconds:.0f}s "
+            f"(limit {LLM_CLEAN_MAX_NOTES} notes / {LLM_CLEAN_MAX_SECONDS:.0f}s). "
+            f"Pick a part or a bar range and clean that."
+        )
 
 
 def section_context(analysis, start: float, end: float, extra: dict | None = None) -> str:
@@ -128,7 +150,7 @@ def suggest_solo(prompt: str, analysis, start: float, end: float,
                  temperature: float = 1.0) -> Solo:
     """Ask Gemini for a solo over a section, returned as structured note data."""
     contents = (
-        f"Write a guitar solo for this section.\n\n"
+        f"Write a high quality, playable, realistic, expressive guitar solo for this section.\n\n"
         f"Musical context:\n{section_context(analysis, start, end, extra)}\n\n"
         f"What the player asked for: {prompt}\n\n"
         f"Fill roughly the whole section. Return JSON only."
@@ -141,7 +163,9 @@ def suggest_solo(prompt: str, analysis, start: float, end: float,
     resp = client.models.generate_content(
         model=model, contents=contents,
         config=_config(system_instruction=SOLO_SYSTEM, temperature=temperature,
-                       response_mime_type="application/json", response_schema=Solo),
+                       response_mime_type="application/json", response_schema=Solo,
+                       thinking_budget=LLM_SOLO_THINKING,
+                       max_output_tokens=LLM_SOLO_MAX_OUTPUT),
     )
     return resp.parsed if resp.parsed else Solo.model_validate_json(resp.text)
 
@@ -165,23 +189,43 @@ def solo_to_notes(solo: Solo, tempo: float, t0: float = 0.0) -> list[Note]:
 
 def notes_to_solonotes(notes: list[Note], tempo: float, t0: float = 0.0) -> list[SoloNote]:
     """Inverse of `solo_to_notes`: absolute-time `Note`s -> beat-relative units,
-    so a transcribed window can be handed to Gemini in the same shape it writes."""
+    so a transcribed window can be handed to Gemini in the same shape it writes.
+
+    Everything is rounded, because these numbers are *sent* and every digit is
+    a billed token. A raw `(n.start - t0) * bps` prints as
+    `14.341232328869047` - 17 significant figures of a float that came from a
+    10ms CREPE frame in the first place. Three decimals of a beat is 1.5ms at
+    123bpm, well inside the transcriber's own resolution, and it halves the
+    payload (13.4k chars -> 7.5k on crystallize's guitar solo).
+    """
     bps = tempo / 60.0
     return [
         SoloNote(
-            beat=(n.start - t0) * bps,
-            duration=max(0.05, n.duration) * bps,
+            beat=round((n.start - t0) * bps, 3),
+            duration=round(max(0.05, n.duration) * bps, 3),
             midi=n.pitch,
             technique=n.technique if n.technique in TECHNIQUES.__args__ else "normal",
-            bend_semitones=float(n.bend),
-            velocity=float(min(1.0, max(0.2, n.velocity))),
+            bend_semitones=round(float(n.bend), 2),
+            velocity=round(float(min(1.0, max(0.2, n.velocity))), 2),
         )
         for n in sorted(notes, key=lambda n: n.start)
     ]
 
 
+def clean_window_cost(notes: list[Note], start: float, end: float) -> tuple[bool, int, float]:
+    """Whether `clean_solo` will accept this window, and the size that decided it.
+
+    Split out from `clean_solo` so a caller can ask *before* spending anything -
+    the web front end greys the button out and the CLI refuses up front, rather
+    than both discovering the limit from a failed job. Enforcement still lives
+    in `clean_solo`; this only answers the same question early.
+    """
+    n, secs = len(notes), max(0.0, end - start)
+    return (n <= LLM_CLEAN_MAX_NOTES and secs <= LLM_CLEAN_MAX_SECONDS), n, secs
+
+
 def clean_solo(notes: list[Note], analysis, start: float, end: float,
-              model: str = GEMINI_MODEL, temperature: float = 0.2) -> CleanedSolo:
+              model: str = GEMINI_CLEAN_MODEL, temperature: float = 0.2) -> CleanedSolo:
     """Ask Gemini to declutter a transcribed note window into a realistic tab.
 
     Machine transcription over-segments: pitch jitter on a held or bent note
@@ -191,26 +235,55 @@ def clean_solo(notes: list[Note], analysis, start: float, end: float,
     without composing anything new - see `CLEAN_SYSTEM`. Low temperature by
     default: this is cleanup, not composition, so it should be the least
     surprising pass over the data that still fixes the obvious mess.
+
+    **This is a snippet operation, and the limit is enforced here** rather than
+    at each caller, so the browser and the terminal cannot disagree about what
+    is too big (the same reason `app._window` calls `cli._window`). The shape
+    of the call is why: the model echoes the window back, so the notes are
+    billed twice and thinking is billed on top of that. A part is ~75 notes; a
+    whole song is ~1400, and asking for one is asking for a hundred times the
+    bill of the thing the button is for. See `TooLongToClean`.
+
+    The payload is compact JSON, not `indent=2`: the indentation was about a
+    fifth of the tokens and the model never reads it.
     """
+    ok, n, secs = clean_window_cost(notes, start, end)
+    if not ok:
+        raise TooLongToClean(n, secs)
+
     solo_notes = notes_to_solonotes(notes, analysis.tempo, t0=start)
     contents = (
         f"Clean up this transcribed solo.\n\n"
         f"Musical context:\n{section_context(analysis, start, end)}\n\n"
         f"Transcribed notes (machine output, {len(solo_notes)} notes):\n"
-        f"{json.dumps([n.model_dump() for n in solo_notes], indent=2)}\n\n"
+        f"{json.dumps([n.model_dump() for n in solo_notes], separators=(',', ':'))}\n\n"
         f"Return the cleaned note list as JSON only."
     )
     client = _client()
     resp = client.models.generate_content(
         model=model, contents=contents,
         config=_config(system_instruction=CLEAN_SYSTEM, temperature=temperature,
-                       response_mime_type="application/json", response_schema=CleanedSolo),
+                       response_mime_type="application/json", response_schema=CleanedSolo,
+                       thinking_budget=LLM_CLEAN_THINKING,
+                       max_output_tokens=LLM_CLEAN_MAX_OUTPUT),
     )
     return resp.parsed if resp.parsed else CleanedSolo.model_validate_json(resp.text)
 
 
 def listening_notes(audio_path: str | Path, analysis, model: str = GEMINI_MODEL) -> str:
-    """Have Gemini listen to the track and describe its musical patterns."""
+    """Have Gemini listen to the track and describe its musical patterns.
+
+    The only call here that sends audio, and therefore the only one whose cost
+    is set by the length of the song rather than the size of a passage: Gemini
+    bills audio at a flat rate per second, so a 4-minute track is ~8.5k input
+    tokens before a word of prompt. That is once per song and it is cached in
+    `llm_notes.txt`, which is why this is opt-in (`analyze --llm`) and not part
+    of a plain analysis - and why the web front end asks first.
+
+    The uploaded file is deleted afterwards. Files API storage expires by
+    itself after 48h, but leaving every song ever analysed sitting in the
+    project's quota serves nobody.
+    """
     client = _client()
     f = client.files.upload(file=str(audio_path))
     contents = [f, (
@@ -220,7 +293,14 @@ def listening_notes(audio_path: str | Path, analysis, model: str = GEMINI_MODEL)
         "scales fit for soloing. Be specific and concise (max ~250 words).\n\n"
         f"Automated analysis so far:\n{json.dumps({'key': analysis.key, 'tempo': round(analysis.tempo, 1), 'progression': analysis.progression(0, analysis.duration)[:24]}, indent=2)}"
     )]
-    return client.models.generate_content(
-        model=model, contents=contents,
-        config=_config(temperature=0.4),
-    ).text.strip()
+    try:
+        return client.models.generate_content(
+            model=model, contents=contents,
+            config=_config(temperature=0.4, thinking_budget=LLM_CLEAN_THINKING,
+                           max_output_tokens=LLM_NOTES_MAX_OUTPUT),
+        ).text.strip()
+    finally:
+        try:
+            client.files.delete(name=f.name)
+        except Exception:                                 # noqa: BLE001
+            pass          # a leftover upload expires on its own; never fail the run for it
