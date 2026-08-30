@@ -58,7 +58,7 @@ except the live panes still works.
 ### 2. Get the code
 
 ```bash
-git clone <this repo> MusicCopilot
+git clone https://github.com/nwulkow/musiccopilot.git
 cd MusicCopilot
 ```
 
