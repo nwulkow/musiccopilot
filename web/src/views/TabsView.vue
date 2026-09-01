@@ -1,7 +1,7 @@
 <script setup>
 import { inject, ref, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, followJob, stemMeta } from '../api'
+import { api, followJob, stemMeta, voiceNote } from '../api'
 import TabGrid from '../components/TabGrid.vue'
 import ScoreSheet from '../components/ScoreSheet.vue'
 
@@ -15,6 +15,10 @@ const stem = ref(route.query.stem || 'guitar')
 const partName = ref(route.query.part || '')
 const bars = ref(route.query.bars || '')
 const subdiv = ref(4)
+// One stem often holds a riff and a strummed chord at once. This picks which
+// of them to read; the server does the splitting (`cli._voice`), so the
+// browser and the terminal cannot disagree about what "melody" means.
+const voice = ref(route.query.voice || 'all')
 const zoom = ref(17)
 const layout = ref(null)
 const loading = ref(false)
@@ -40,6 +44,7 @@ const shown = computed(() => view.value || (meta.value.fretted ? 'grid' : 'sheet
  */
 function windowParams() {
   const p = { stem: stem.value, subdiv: subdiv.value }
+  if (voice.value !== 'all') p.voice = voice.value
   if (partName.value) p.part = partName.value
   else if (bars.value) p.bars = bars.value
   else { p.start = 0; p.end = song.value?.analysis?.duration ?? 0 }
@@ -94,12 +99,13 @@ function llmClean() {
 }
 
 /** Keep the URL describing what is on screen, so a passage can be linked to. */
-watch([stem, partName, bars, view], () => {
+watch([stem, partName, bars, view, voice], () => {
   router.replace({ query: {
     stem: stem.value,
     ...(partName.value ? { part: partName.value } : {}),
     ...(bars.value && !partName.value ? { bars: bars.value } : {}),
     ...(view.value ? { view: view.value } : {}),
+    ...(voice.value !== 'all' ? { voice: voice.value } : {}),
   } })
   load()
 })
@@ -158,6 +164,7 @@ const kindLabel = computed(() => {
             class="btn btn-sm stembtn"
             :class="{ active: stem === s }"
             :style="{ '--c': stemMeta(s).color }"
+            :title="voiceNote(song, s)"
             @click="stem = s"
           >
             {{ stemMeta(s).label }}
@@ -201,6 +208,15 @@ const kindLabel = computed(() => {
           <option :value="2">8ths</option>
           <option :value="4">16ths</option>
           <option :value="8">32nds</option>
+        </select>
+      </div>
+
+      <div class="cgroup">
+        <span class="eyebrow">Read</span>
+        <select v-model="voice">
+          <option value="all">everything</option>
+          <option value="melody">the line</option>
+          <option value="backing">under it</option>
         </select>
       </div>
 

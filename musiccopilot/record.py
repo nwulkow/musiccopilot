@@ -92,6 +92,13 @@ class Recorder:
         y = self._buf[: self._n]
         return y.mean(axis=1) if y.shape[1] > 1 else y[:, 0]
 
+    def frames(self) -> np.ndarray:
+        """Everything captured so far as `(channels, n)` - the shape `audio.save`
+        writes. `audio()` folds to mono for the live transcriber; a capture of a
+        record has to keep its two channels, because that is what demucs
+        separates from."""
+        return np.ascontiguousarray(self._buf[: self._n].T)
+
     def tail(self, seconds: float) -> tuple[np.ndarray, float]:
         """The last `seconds` of audio, and the time it starts at."""
         n = int(seconds * self.sr)

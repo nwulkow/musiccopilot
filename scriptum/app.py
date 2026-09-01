@@ -17,18 +17,21 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import soundfile as sf
+
 from fastapi import (Body, FastAPI, File, Form, HTTPException, UploadFile,
                      WebSocket, WebSocketDisconnect)
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from musiccopilot import cli, notes as nt, report
+from musiccopilot import audio as au, cli, notes as nt, report
 from musiccopilot.config import (LLM_CLEAN_MAX_NOTES, LLM_CLEAN_MAX_SECONDS, SR,
                                  STEM_NAMES, base_stem, fretboard_for, workdir_for)
 from musiccopilot.pipeline import TRANSCRIBE_STEMS, Song
 
-from . import library, live, serialize
+from . import capture, library, live, serialize
 from .jobs import JOBS
 
 WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
@@ -67,6 +70,21 @@ def _safe(work: Path, *parts: str) -> Path:
     if not str(p).startswith(str(work.resolve())) or not p.is_file():
         raise HTTPException(404, "no such file")
     return p
+
+
+def _wav_response(y, sr: int) -> FileResponse:
+    """Serve a computed (mono or stereo) signal as a wav, without keeping it.
+
+    A temp file rather than an in-memory `StreamingResponse`: Starlette's
+    `FileResponse` answers HTTP range requests, which `<audio>` elements use
+    to seek and to probe duration before the whole file has arrived, and a
+    streamed `BytesIO` cannot. The file is unlinked once the response has been
+    sent - this is for a mix nobody wants kept, not a cache.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    sf.write(tmp.name, y.T if y.ndim > 1 else y, sr)
+    return FileResponse(tmp.name, media_type="audio/wav",
+                        background=BackgroundTask(lambda: os.unlink(tmp.name)))
 
 
 def _window(song, part=None, bars=None, start=None, end=None):
@@ -390,6 +408,55 @@ def create_app() -> FastAPI:
             raise HTTPException(404, f"no song {song_id!r}")
         return {"deleted": song_id}
 
+    # ---------------------------------------------------------------- capture
+    #
+    # Recording an input device into the library. The device is usually a
+    # loopback driver (BlackHole, Loopback), which is how a song you can only
+    # stream becomes a file the pipeline can read. Like the live panes, the
+    # device belongs to the *server* - Scriptum records on the machine it runs
+    # on, and the browser is only the control surface.
+    #
+    # There is no `analyze` option here on purpose. Stopping a capture creates
+    # a library song exactly as an upload does, and the client already knows
+    # how to analyse one of those - see `LibraryView.upload`. Wiring a second
+    # path to the same job would be two things to keep in step.
+    @app.get("/api/capture")
+    def capture_status() -> dict:
+        """The running capture's meter, or that there is none.
+
+        Polled a few times a second while recording, and once on page load: the
+        session lives in the server, so a browser closed mid-take comes back to
+        find the recording still running rather than to a lost take.
+        """
+        return capture.CAPTURES.status()
+
+    @app.post("/api/capture/start")
+    def capture_start(body: dict = Body(default={})) -> dict:
+        """Open an input device and start recording."""
+        try:
+            device = cli._input_device(body.get("device"))
+        except SystemExit as exc:                   # cli raises this for a bad name
+            raise HTTPException(400, str(exc)) from exc
+        try:
+            return capture.CAPTURES.start(
+                name=str(body.get("name") or "").strip(),
+                device=device,
+                mono=bool(body.get("mono")),
+                max_minutes=float(body.get("max_minutes") or 12.0))
+        except RuntimeError as exc:                 # one sound card, one capture
+            raise HTTPException(409, str(exc)) from exc
+        except Exception as exc:                    # noqa: BLE001 - device refused
+            raise HTTPException(400, f"cannot record from that device: {exc}") from exc
+
+    @app.post("/api/capture/stop")
+    def capture_stop(body: dict = Body(default={})) -> dict:
+        """Finish the capture: file it as a song, or throw it away."""
+        try:
+            return capture.CAPTURES.stop(library.library_root(),
+                                         discard=bool(body.get("discard")))
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     # ------------------------------------------------------------------ songs
     @app.get("/api/songs/{song_id}")
     def get_song(song_id: str) -> dict:
@@ -416,6 +483,10 @@ def create_app() -> FastAPI:
             # stop promising a stem-separation pass that will not run, and to
             # say which of the band's tracks each stem actually is.
             "sources": song.sources or None,
+            # Which stems demucs handed over as one file that turned out to
+            # hold more than one player - and which ones were checked and
+            # were not. Both are worth showing.
+            "voices": serialize.voices_json(song.voices) if song.voices else None,
             "note_stems": {s: len(ns) for s, ns in sorted(song.notes.items())},
             "note_backends": dict(sorted(song.note_backends.items())),
             "llm_notes": song.llm_notes,
@@ -435,7 +506,9 @@ def create_app() -> FastAPI:
                 separate=opts.get("separate", True),
                 do_lyrics=opts.get("lyrics", True),
                 do_notes=opts.get("notes", True),
-                do_snippets=opts.get("snippets", True),
+                do_snippets=opts.get("snippets", False),
+                do_voices=opts.get("voices", True),
+                voice_count=opts.get("voice_count") or None,
                 llm=opts.get("llm", False),
                 force=opts.get("force", False),
                 whisper_size=opts.get("whisper", "base"),
@@ -482,6 +555,52 @@ def create_app() -> FastAPI:
             return {"song": song_id, "backend": backend, "stems": sorted(changed)}
 
         return JOBS.start("transcribe", song_id, work).snapshot()
+
+    @app.post("/api/songs/{song_id}/voices")
+    def split_voices(song_id: str, body: dict = Body(default={})) -> dict:
+        """Look inside a stem for more than one player, or put one back together.
+
+        A job rather than a request for the usual two reasons: it re-reads the
+        stem and re-detects the form, which is tens of seconds, and `JOBS`'
+        one-per-song rule is what stops it renaming stems out from under a
+        running analysis.
+
+        `count` insists on a number of players instead of letting the split
+        decide, and implies a redo - otherwise asking for three on an
+        already-split song would find the stem accounted for and do nothing.
+        """
+        song = _song(song_id)          # the split clusters notes, so it needs them
+        if song.sources and not body.get("undo"):
+            raise HTTPException(400, {
+                "error": "imported",
+                "detail": "these stems are the band's own tracks, one player each"})
+        count = body.get("count") or None
+        if count is not None and not (isinstance(count, int) and 1 <= count <= 4):
+            raise HTTPException(400, f"count must be 1-4, got {count!r}")
+        stems, undo = body.get("stems") or None, bool(body.get("undo"))
+        force, path = bool(body.get("force")) or bool(count), song.path
+
+        def work(job) -> dict:
+            """Split (or merge) on a worker thread, then rebuild what depended on it."""
+            fresh = Song.open(path)
+            changed: set[str] = set()
+            if undo:
+                for source in list(fresh.voices):
+                    changed |= fresh.merge_voices(source, log=job.log)
+            else:
+                changed = fresh.split_voices(stems=stems, count=count, force=force,
+                                             log=job.log)
+            if changed:
+                # The form reads which stem leads a solo, and that question has
+                # a different answer once a guitar has become two; the chart
+                # and the part snippets are cut from the form.
+                fresh = Song.open(path).run(log=job.log)
+                from musiccopilot import chart as chart_mod
+                chart_mod.write(fresh)
+            job.log("done" if changed else "nothing changed")
+            return {"song": song_id, "stems": sorted(changed)}
+
+        return JOBS.start("voices", song_id, work).snapshot()
 
     @app.post("/api/songs/{song_id}/tracks")
     def reassign_tracks(song_id: str, body: dict = Body(...)) -> dict:
@@ -559,7 +678,7 @@ def create_app() -> FastAPI:
 
     # -------------------------------------------------------------------- tab
     def _tab_payload(song, song_id, stem, part, bars, start, end, subdiv,
-                     clean=False) -> dict:
+                     clean=False, voice="all") -> dict:
         """Everything the client needs to draw one passage of one stem.
 
         Shared by the plain tab request and the cleanup job so both return
@@ -571,7 +690,13 @@ def create_app() -> FastAPI:
             raise HTTPException(404, {"error": "no_notes", "stem": stem,
                                       "have": sorted(song.notes)})
         t_start, t_end, title = _window(song, part, bars, start, end)
-        window = nt.in_window(ns, t_start, t_end)
+        # `cli._voice` for the same reason `_window` is `cli._window`: which
+        # notes "melody" means must not differ between the browser and the
+        # terminal.
+        try:
+            window = cli._voice(nt.in_window(ns, t_start, t_end), voice)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         from musiccopilot.gemini import clean_window_cost
         # Whether the cleanup button applies to *this* window is a fact about
         # the limit in `musiccopilot.config`, so it is answered here and sent
@@ -597,6 +722,7 @@ def create_app() -> FastAPI:
         out["heading"] = report.window_title(song, t_start, t_end,
                                              f"{title} · " if title else "")
         out["llm_clean"] = cleaned
+        out["voice"] = voice
         out["clean_ok"] = can_clean
         out["clean_size"] = {"notes": n_win, "seconds": round(secs_win, 1),
                              "max_notes": LLM_CLEAN_MAX_NOTES,
@@ -611,21 +737,24 @@ def create_app() -> FastAPI:
     @app.get("/api/songs/{song_id}/tab")
     def get_tab(song_id: str, stem: str = "guitar", part: str | None = None,
                 bars: str | None = None, start: str | None = None,
-                end: str | None = None, subdiv: int = 4) -> dict:
+                end: str | None = None, subdiv: int = 4,
+                voice: str = "all") -> dict:
         """A drawable tab or staff for a passage.
 
         The window is resolved by the CLI's own `_window`, so `part`, `bars`,
         `start` and `end` behave identically to the command line (including
-        `1:02` and `bar17` forms).
+        `1:02` and `bar17` forms). `voice` is the same choice `--voice` makes:
+        the whole stem, the line being played, or what is under it.
         """
         return _tab_payload(_song(song_id), song_id, stem, part, bars, start,
-                            end, subdiv)
+                            end, subdiv, voice=voice)
 
     # ------------------------------------------------------------------ score
     @app.get("/api/songs/{song_id}/score")
     def get_score(song_id: str, stem: str = "piano", part: str | None = None,
                   bars: str | None = None, start: str | None = None,
-                  end: str | None = None, subdiv: int = 4) -> dict:
+                  end: str | None = None, subdiv: int = 4,
+                  voice: str = "all") -> dict:
         """A passage as engraved notation rather than a grid.
 
         Same window vocabulary as `/tab` (it goes through the same
@@ -642,7 +771,10 @@ def create_app() -> FastAPI:
 
         a = song.analysis
         t_start, t_end, title = _window(song, part, bars, start, end)
-        window = nt.in_window(ns, t_start, t_end)
+        try:
+            window = cli._voice(nt.in_window(ns, t_start, t_end), voice)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         built = build_score(
             window, tempo=a.tempo, t0=t_start, beats_per_bar=a.beats_per_bar,
             subdiv=subdiv, first_bar=report.bar_number(song, t_start),
@@ -652,6 +784,7 @@ def create_app() -> FastAPI:
                                    start=t_start, end=t_end)
         out["heading"] = report.window_title(song, t_start, t_end,
                                              f"{title} · " if title else "")
+        out["voice"] = voice
         out["notes"] = [serialize.note_json(n) for n in window]
         return out
 
@@ -700,7 +833,7 @@ def create_app() -> FastAPI:
             out = _tab_payload(song, song_id, stem, body.get("part"),
                                body.get("bars"), body.get("start"),
                                body.get("end"), int(body.get("subdiv", 4)),
-                               clean=True)
+                               clean=True, voice=body.get("voice", "all"))
             c = out["llm_clean"]
             job.log(f"• {c['before']} → {c['after']} notes" if c else "• nothing to clean")
             job.log("done")
@@ -803,15 +936,30 @@ def create_app() -> FastAPI:
 
     @app.get("/api/songs/{song_id}/media/stem/{stem}")
     def media_stem(song_id: str, stem: str):
-        """One separated stem."""
+        """One separated stem - `.m4a` for a song analysed since stem
+        compression, `.wav` for one cached before it."""
         song = _song(song_id, need="none")
-        return FileResponse(_safe(song.work, "stems", f"{stem}.wav"))
+        path = song.stems.get(stem)
+        if path is None or not path.is_file():
+            raise HTTPException(404, "no such stem")
+        return FileResponse(path)
 
-    @app.get("/api/songs/{song_id}/media/snippet/{name}")
-    def media_snippet(song_id: str, name: str):
-        """One part's audio excerpt."""
-        song = _song(song_id, need="none")
-        return FileResponse(_safe(song.work, "snippets", name))
+    @app.get("/api/songs/{song_id}/media/snippet/{slug}")
+    def media_snippet(song_id: str, slug: str):
+        """One part's audio excerpt, cut on the fly from the mixdown.
+
+        Parts used to each get a pre-rendered wav under `snippets/` - 90 MB on
+        a four-minute song for a feature that is only ever a few seconds of
+        playback at a time. `Part.start`/`end` already say exactly what to
+        cut, so this slices the source audio per request instead; a browser
+        never asks for the same ten seconds often enough for that to matter.
+        """
+        song = _song(song_id, need="form")
+        part = next((p for p in song.form.parts if p.slug == slug), None)
+        if part is None:
+            raise HTTPException(404, "no such part")
+        y = au.excerpt(song.audio(mono=False), part.start, part.end, SR)
+        return _wav_response(y, SR)
 
     @app.get("/api/songs/{song_id}/media/file/{name}")
     def media_file(song_id: str, name: str):
@@ -823,18 +971,19 @@ def create_app() -> FastAPI:
     def media_backing(song_id: str, exclude: str = "guitar"):
         """The song minus one or more stems - the play-along bed.
 
-        Cached per exclusion set: mixing stems means decoding several wavs, and
-        a play-along that re-does that on every seek is unusable.
+        Mixed fresh on every request rather than cached to disk. It used to
+        write a `_backing_minus_<stems>.wav` per exclusion set and never clean
+        any of them up - one song's worth reached 14 files and 312 MB, because
+        the set of possible exclusions is the power set of its stems. `load()`
+        (`useTransport.js`) only calls this once per stem toggle, not once per
+        seek, so decoding a handful of stems here is a one-off per toggle, not
+        a hot path - the cost this used to be cached against.
         """
-        from musiccopilot import audio
         song = _song(song_id, need="none")
         drop = tuple(sorted(s for s in exclude.split(",") if s))
         if not song.stems:
             return FileResponse(song.path)
-        out = song.work / f"_backing_minus_{'-'.join(drop) or 'none'}.wav"
-        if not out.exists():
-            audio.save(out, song.backing(exclude=drop), SR)
-        return FileResponse(out)
+        return _wav_response(song.backing(exclude=drop), SR)
 
     # ------------------------------------------------------------------- jobs
     @app.get("/api/jobs")

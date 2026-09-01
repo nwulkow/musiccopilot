@@ -86,6 +86,30 @@ const engines = computed(() => {
 const stale = computed(() =>
   wanted.value && engines.value.some((e) => e.name !== wanted.value))
 
+// Separation gives one `guitar` file however many guitarists played, so the
+// pipeline splits that stem again into the players inside it. Which players it
+// found - or why it decided there was only one - is worth showing, because a
+// tab that is obviously two guitars and a page that says nothing about it
+// leaves the reader with no idea the question was even asked.
+const voiceCount = ref('')          // '' = let the split decide
+const splits = computed(() =>
+  Object.entries(song.value?.voices || {}).map(([source, v]) => ({ source, ...v })))
+const anySplit = computed(() => splits.value.some((s) => s.split))
+
+// What the button will actually do, so its label cannot disagree with it -
+// "treat as one" is an undo wearing the same button.
+const voiceAction = computed(() => {
+  if (voiceCount.value === '1') return 'Treat as one guitar'
+  return splits.value.length ? 'Look again' : 'Find the guitarists'
+})
+
+async function splitVoices(opts = {}) {
+  try {
+    watchJob(await api.voices(props.id, opts))
+    voiceCount.value = ''
+  } catch (e) { err.value = e.detail?.detail || e.message }
+}
+
 // On an imported multitrack a stem is one of the band's own tracks, and which
 // one is not always guessable from the name - `guitar-2` could be either
 // guitarist. `sources.json` remembers, so the chip can say.
@@ -177,6 +201,40 @@ function reassigned(j) {
           <RouterLink to="/settings" class="setlink">Change engine</RouterLink>
         </div>
 
+        <!-- who is playing the guitar stem -->
+        <div v-if="!song.sources" class="engines voices">
+          <span class="eyebrow">Guitars</span>
+          <template v-for="sp in splits" :key="sp.source">
+            <span
+              v-for="v in sp.voices" :key="v.stem"
+              class="chip" :class="{ 'chip-gold': sp.split }" :title="sp.reason"
+            >
+              {{ v.stem }}
+              <!-- the role leads: "the one playing chords" identifies a part
+                   in a way "bright, panned left" does not -->
+              <span class="dim">· {{ sp.split ? [v.role, v.tone, v.placement].filter(Boolean).join(', ') : 'one player' }}</span>
+            </span>
+          </template>
+          <span v-if="!splits.length" class="dim tiny">not looked at yet</span>
+
+          <select v-model="voiceCount" class="vcount" :disabled="busy">
+            <option value="">however many there are</option>
+            <option value="1">treat as one</option>
+            <option value="2">two guitarists</option>
+            <option value="3">three guitarists</option>
+          </select>
+          <button
+            class="btn btn-sm" :disabled="busy"
+            @click="voiceCount === '1'
+              ? splitVoices({ undo: true })
+              : splitVoices({ count: Number(voiceCount) || null, force: !!splits.length })"
+          >{{ busy ? 'Working…' : voiceAction }}</button>
+          <button
+            v-if="anySplit" class="btn btn-sm btn-ghost" :disabled="busy"
+            @click="splitVoices({ undo: true })"
+          >Put back together</button>
+        </div>
+
         <nav class="tabs">
           <RouterLink
             v-for="t in TABS" :key="t.name"
@@ -223,6 +281,9 @@ function reassigned(j) {
 }
 .engines .eyebrow { padding-right: 2px; }
 .engines .dim { color: var(--text-4); }
+.voices { margin-top: 9px; }
+.voices .tiny { font-size: 11.5px; }
+.vcount { width: auto; padding: 4px 8px; font-size: 12.5px; }
 .setlink { font-size: 12px; color: var(--text-3); }
 
 .tabs {

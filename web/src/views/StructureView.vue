@@ -29,10 +29,12 @@ function colorOf(p) {
 }
 
 function playSnippet(p) {
-  if (!p.snippet) return
+  if (!p.slug) return
   if (audio) { audio.pause(); audio = null }
   if (playingPart.value === p.name) { playingPart.value = null; return }
-  audio = new Audio(api.media.snippet(props.id, p.snippet))
+  // Cut on the server from `p.start`/`p.end` each time - there is no
+  // pre-rendered file to check for any more (see `app.media_snippet`).
+  audio = new Audio(api.media.snippet(props.id, p.slug))
   audio.play()
   playingPart.value = p.name
   audio.onended = () => { playingPart.value = null }
@@ -99,8 +101,8 @@ onBeforeUnmount(() => { if (audio) audio.pause() })
           <button
             class="play"
             :class="{ playing: playingPart === p.name }"
-            :disabled="!p.snippet"
-            :title="p.snippet ? 'Play this part' : 'No snippet cut yet'"
+            :disabled="!p.slug"
+            title="Play this part"
             @click.stop="playSnippet(p)"
           >{{ playingPart === p.name ? '■' : '▶' }}</button>
 

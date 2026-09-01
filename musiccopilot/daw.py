@@ -1,7 +1,7 @@
 """Import a multitrack session from a DAW - GarageBand or BandLab.
 
 Everything downstream of separation already works off `analyzed_songs/<id>/
-stems/*.wav`, so importing a real multitrack is not a new pipeline: it is the
+stems/*`, so importing a real multitrack is not a new pipeline: it is the
 *same* pipeline with its slowest and least reliable stage deleted. This module
 writes the stems demucs would otherwise have guessed at, synthesises the
 mixdown the rest of the code treats as "the song", and records what came from
@@ -386,9 +386,9 @@ def import_session(session: Session, *, name: str | None = None,
     source folder a second time.
 
     Writes `<out>/<name>.wav` (the mixdown, which is what `Song.path` means)
-    and `analyzed_songs/<name>/stems/*.wav` beside it, then leaves the rest to
-    the normal pipeline: `analyze` on the result skips separation and goes
-    straight to tempo, chords and form.
+    and `analyzed_songs/<name>/stems/*` beside it (`audio.STEM_EXT`), then
+    leaves the rest to the normal pipeline: `analyze` on the result skips
+    separation and goes straight to tempo, chords and form.
     """
     out = Path(out).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -397,14 +397,20 @@ def import_session(session: Session, *, name: str | None = None,
     work = workdir_for(song_path)
     stem_dir = work / "stems"
     stem_dir.mkdir(parents=True, exist_ok=True)
-    for old in stem_dir.glob("*.wav"):          # a re-import replaces the set
-        old.unlink()
+    for old in list(stem_dir.glob("*.wav")) + list(stem_dir.glob(f"*{audio.STEM_EXT}")):
+        old.unlink()                            # a re-import replaces the set
 
     written: list[Path] = []
     for track in session.tracks:
         y = audio.load(track.path, SR, mono=False)
-        written.append(audio.save(stem_dir / f"{track.stem}.wav", y, SR))
-        log(f"  {track.name} -> {track.stem}.wav")
+        # These are the band's own recordings, not something `voices.py` will
+        # ever look inside (an imported multitrack is never touched - see
+        # CLAUDE.md), but they are real takes rather than derived audio, so
+        # this keeps whatever channels they were recorded with instead of
+        # deciding a DI or room mic did not mean it.
+        written.append(audio.save_stem(stem_dir / f"{track.stem}{audio.STEM_EXT}",
+                                       y, SR, stereo=True))
+        log(f"  {track.name} -> {track.stem}{audio.STEM_EXT}")
 
     if session.mixdown is not None:
         # The DAW's own bounce beats anything summed here: it carries the mix
@@ -439,23 +445,32 @@ def import_session(session: Session, *, name: str | None = None,
 # instead: the audio is already correct, only the labels on it were wrong.
 
 
-def _shuffle(folder: Path, suffix: str, moves: dict[str, str]) -> None:
+def _shuffle(folder: Path, suffixes: str | tuple[str, ...],
+            moves: dict[str, str]) -> None:
     """Rename a set of files that may be permuting among themselves.
 
     Two guitarists swapping places is `guitar -> guitar-2` and `guitar-2 ->
     guitar` at once, so every file goes to a temporary name before any takes
     its final one - renaming them one at a time would have the first move
     overwrite the other half of the swap. The temporary name keeps the real
-    suffix in the middle (`guitar.wav.moving`), so a crash between the two
-    passes leaves files the `stems/*.wav` glob does not pick up as a stem
-    called `~guitar`.
+    suffix in the middle (`guitar.m4a.moving`), so a crash between the two
+    passes leaves files the `stems/*` glob does not pick up as a stem called
+    `~guitar`.
+
+    `suffixes` may be more than one extension - a cache from before stem
+    compression has `.wav` stems, a fresh one has `audio.STEM_EXT` - and each
+    file keeps whichever one it is actually found with.
     """
+    if isinstance(suffixes, str):
+        suffixes = (suffixes,)
     parked = {}
     for old in moves:
-        src = folder / f"{old}{suffix}"
-        if src.exists():
-            parked[old] = src.rename(folder / f"{old}{suffix}.moving")
-    for old, src in parked.items():
+        for suffix in suffixes:
+            src = folder / f"{old}{suffix}"
+            if src.exists():
+                parked[old] = (src.rename(folder / f"{old}{suffix}.moving"), suffix)
+                break
+    for old, (src, suffix) in parked.items():
         src.rename(folder / f"{moves[old]}{suffix}")
 
 
@@ -529,17 +544,22 @@ def reassign(work: str | Path, mapping: dict[str, str], *, log=print) -> dict:
     dropped = [old for old in moves if old not in kept]
 
     notes = work / "notes"
-    backends = json.loads((work / "note_backends.json").read_text()) \
-        if (work / "note_backends.json").exists() else {}
     for old in dropped:
         (notes / f"{old}.json").unlink(missing_ok=True)
-        backends.pop(old, None)
-    _shuffle(work / "stems", ".wav", moves)
+    _shuffle(work / "stems", (audio.STEM_EXT, ".wav"), moves)
     _shuffle(notes, ".json", kept)
-    # Rewritten even when it comes out empty: leaving the old file behind would
-    # keep claiming an engine for a stem name nothing answers to any more.
-    (work / "note_backends.json").write_text(
-        json.dumps({kept.get(s, s): b for s, b in backends.items()}, indent=1))
+    # Both per-stem records travel with the notes they describe: which engine
+    # read them, and which revision of the shaping passes (`clean`, then
+    # `texture`) they went through. Each
+    # is rewritten even when it comes out empty, because leaving the old file
+    # behind would keep making a claim about a stem name nothing answers to.
+    for record in ("note_backends.json", "notes_clean.json"):
+        rows = json.loads((work / record).read_text()) \
+            if (work / record).exists() else {}
+        for old in dropped:
+            rows.pop(old, None)
+        (work / record).write_text(
+            json.dumps({kept.get(s, s): v for s, v in rows.items()}, indent=1))
 
     # What the labels were load-bearing for, and therefore what has to be read
     # again. Only the *instrument* matters to most of it: the chord track comes

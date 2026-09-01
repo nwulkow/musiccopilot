@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
+from . import texture as tex
 from .analysis import KK_MAJOR, KK_MINOR
 from .config import (CHORD_QUALITIES, FORM, NOTE_NAMES, QUALITY_SUFFIX, SR,
                      base_stem)
@@ -824,7 +825,13 @@ def _assign(segs: list[_Seg], duration: float, letters: dict[int, str]) -> None:
             s.role = "Outro"
         elif leads:
             s.lead = lead
-            s.role = f"{lead.capitalize()} solo" if lead in ("guitar", "piano", "bass") else "Solo"
+            # Named for the *instrument*, not the stem: a split guitar's lead
+            # voice is `guitar-2`, and without `base_stem` here it is a plain
+            # "Solo" - which is the one place a suffixed stem name reaches the
+            # user as a part title. See CLAUDE.md, "Stem names are load-bearing".
+            instrument = base_stem(lead)
+            s.role = (f"{instrument.capitalize()} solo"
+                      if instrument in ("guitar", "piano", "bass") else "Solo")
         elif s.i1 - s.i0 <= FORM["min_bars"]:
             s.role = "Break"
         else:
@@ -892,6 +899,23 @@ def detect_form(analysis, y: np.ndarray, sr: int = SR, vocals: np.ndarray | None
                 spread = min(1.0, (max(pitches) - min(pitches)) / 24.0)
                 variety = min(1.0, len(set(p % 12 for p in pitches)) / 8.0)
                 weight *= 0.4 + 0.6 * (0.5 * spread + 0.5 * variety)
+            # And by whether it is playing a *line* at all. A lead is one note
+            # at a time; a guitar strumming underneath one can match it for
+            # note rate and is never the lead - it is the same argument that
+            # keeps `bass` out of LEAD_STEMS, and it only became measurable
+            # once `texture` could say which notes were struck together.
+            #
+            # This matters most exactly where it is newest. Before a stem is
+            # split into players, a solo's runner-up is a near-silent piano
+            # and the ratio is huge; after `voices.py` splits one guitar into
+            # a rhythm part and a lead, the runner-up *is* the rhythm guitar,
+            # playing all the way through the solo, and `solo_density` stops
+            # being clearable. Without this a split silently demotes every
+            # "Guitar solo" to "Instrumental" and takes the monophonic
+            # re-transcription - and every bend in the tab - with it.
+            if win:
+                chordal = float(tex.chordness(win).mean())
+                weight *= 1.0 - FORM["lead_chord_penalty"] * chordal
             density[stem] = rate * weight * LEAD_STEM_BIAS.get(base_stem(stem), 1.0)
         segs.append(_Seg(i0, i1, fam, start, end,
                          float(voice[i0:i1].mean()), float(energy[i0:i1].mean()),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 
@@ -33,8 +34,9 @@ def _candidates(pitch: int, tuning) -> list[tuple[int, int]]:
 # string. Costing each note only against the previous one misses that: every
 # pitch is reachable on the high string somewhere, so a purely local optimiser
 # walks the melody up the E string and climbs the neck instead of staying in
-# the box. So the Viterbi state here is (string, fret, hand position), and the
-# hand pays to move even when the individual note interval is small.
+# the box. So the Viterbi state here is the hand position, each event is placed
+# as a whole against it (`_placement`), and the hand pays to move even when the
+# individual note interval is small.
 
 BOX = 4                    # frets under the hand without shifting
 _OPEN_BONUS = 0.10         # an open string is easy, but not free everywhere
@@ -43,14 +45,36 @@ _OPEN_BONUS = 0.10         # an open string is easy, but not free everywhere
 def _position_cost(fret: int, hand: int, open_penalty: float = 0.0) -> float:
     """Cost of fretting `fret` with the hand anchored at `hand`."""
     if fret == 0:
-        # open strings belong to open position; up the neck they mean letting
-        # go of the box, so they stop being a bargain
-        return -_OPEN_BONUS + 0.10 * hand + open_penalty
+        # Open strings belong to open position; up the neck they mean letting
+        # go of the box, so they stop being a bargain. Bounded, because
+        # letting go is no harder from the twelfth fret than from the fifth -
+        # unbounded, this charged an open E5 shape more than a barre and was
+        # half of why a strummed verse drifted up the neck and stayed there.
+        return -_OPEN_BONUS + 0.10 * min(hand, BOX) + open_penalty
     reach = fret - hand
     if 0 <= reach < BOX:
         return 0.02 * reach                    # under the fingers already
     # outside the box: a stretch, and increasingly implausible
     return 0.35 + 0.5 * (reach - BOX + 1 if reach >= BOX else -reach)
+
+
+# Everything under the hand costs about the same (0.02 a fret across the box),
+# so two readings of a strummed chord - the open shape, and a barre seven frets
+# up - come out within a hundredth of each other, and the winner is then decided
+# by whatever the hand happened to be doing beforehand. `_hand_cost` makes that
+# accidental choice permanent: coming back down a fifth costs 4.5, which no
+# per-event saving of 0.02 will ever repay, so one event that genuinely wants a
+# high hand drags the rest of the passage up with it. Crystallize's second verse
+# went up to the seventh and printed the open E5 it starts on as a five-string
+# barre for the rest of the part.
+#
+# So low positions win ties. That is true of playing (given two equally
+# comfortable readings people take the one nearer the nut) and it is true of
+# this tab in particular, which prints chord names above the grid: a reader
+# seeing `E5` wants the shape that name means. It is deliberately small enough
+# to settle a tie and nothing more - a real solo up at the ninth costs several
+# points down at the nut, and pays a fraction of one without noticing.
+_LOW_BIAS = 0.02
 
 
 def _hand_cost(prev_hand: int, hand: int) -> float:
@@ -77,6 +101,63 @@ def _hand_options(tuning) -> list[int]:
     return list(range(0, MAX_FRET - BOX + 2))
 
 
+# Rather than print a fret nobody would reach for, leave the note out. Priced
+# against `_position_cost`, which charges 0.5 a fret past the box: dropping
+# wins once a note would need about four frets of stretch.
+#
+# Only ever offered to a note in a *chord*, and that restriction is the whole
+# safety of it. A chord can have more notes than the hand has strings to put
+# them on - a phantom partial stacked on a six-note strum leaves nothing free
+# but the far end of the neck, and a tab that omits it is closer to the truth
+# than one that prints `D22`. A single note cannot be in that position: there
+# is always somewhere to put it, and hiding one because the hand happens to be
+# elsewhere would silently delete the highest note of a phrase. Whether a lone
+# high note is real is `clean.py`'s question, not the fretboard's.
+_DROP_COST = 2.2
+# A chord's notes climb the strings as they climb in pitch. Voicings that
+# cross do exist, so this is a nudge and not a rule.
+_CROSS_COST = 0.25
+
+
+@lru_cache(maxsize=8192)
+def _placement(pitches: tuple[int, ...], tuning: tuple[int, ...], hand: int,
+               open_penalty: float) -> tuple[float, int, tuple[int | None, ...]]:
+    """Cheapest way one hand at `hand` can hold this event, as
+    `(cost, lowest string used, string per pitch)` - None where a note is
+    better left out than placed.
+
+    `pitches` must be ascending; the string each one lands on is chosen
+    jointly, by a dynamic program over which strings are still free, so no
+    note's placement can strand the notes after it. States are (notes placed,
+    strings used, last string), which is at most 6 x 64 x 7 - small enough to
+    solve exactly, and memoised because a song plays the same chord in the
+    same position over and over.
+    """
+    droppable = len(pitches) > 1
+    # state: (used-string bitmask, last string used) -> (cost, choices)
+    best: dict[tuple[int, int], tuple[float, tuple[int | None, ...]]] = {(0, -1): (0.0, ())}
+    for pitch in pitches:
+        cands = _candidates(pitch, tuning)
+        nxt: dict[tuple[int, int], tuple[float, tuple[int | None, ...]]] = {}
+        for (mask, last), (c, chosen) in best.items():
+            # a pitch off the end of the neck has nowhere to go but out
+            options = [(c + _DROP_COST, (mask, last), None)] \
+                if droppable or not cands else []
+            for s, f in cands:
+                if mask & (1 << s):
+                    continue
+                cost = c + _position_cost(f, hand, open_penalty) \
+                    + _CROSS_COST * max(0, last - s)
+                options.append((cost, (mask | (1 << s), s), s))
+            for cost, key, s in options:
+                if key not in nxt or cost < nxt[key][0]:
+                    nxt[key] = (cost, chosen + (s,))
+        best = nxt
+    cost, chosen = min(best.values(), key=lambda v: v[0])
+    placed = [s for s in chosen if s is not None]
+    return cost + _LOW_BIAS * hand, (min(placed) if placed else 0), chosen
+
+
 def _open_penalty(notes: list[Note], tuning) -> float:
     """How much to discourage open strings for *this* passage.
 
@@ -100,14 +181,85 @@ def _open_penalty(notes: list[Note], tuning) -> float:
 
 
 def _group(notes: list[Note], tol: float = 0.05) -> list[list[Note]]:
-    """Cluster near-simultaneous notes (a chord stab) into one event."""
+    """Cluster near-simultaneous notes (a chord stab) into one event.
+
+    Each event comes back in pitch order, not onset order: a strum's notes
+    land a few milliseconds apart in whatever order the tracker found them,
+    and everything downstream reads an event as a chord from the bottom up.
+    """
     groups: list[list[Note]] = []
     for n in sorted(notes, key=lambda n: (n.start, n.pitch)):
         if groups and n.start - groups[-1][0].start <= tol:
             groups[-1].append(n)
         else:
             groups.append([n])
-    return groups
+    return [sorted(g, key=lambda n: n.pitch) for g in groups]
+
+
+# --- reading one line out of a stem -----------------------------------------
+#
+# A guitar stem is one file however many parts were played into it, so the tab
+# of a verse is a riff and a strummed chord and an arpeggio all on the same six
+# strings at once - and the line you were trying to learn is somewhere in
+# there. `voices.py` is the answer when the parts were played by *different
+# people* (it splits the stem itself); this is the answer when they were not,
+# or when the split has already happened and one player is still doing two
+# things. It chooses nothing about what is true - both halves are notes the
+# stem really contains - so it lives at display time and changes no cache.
+
+# Balanced against each other on purpose: an octave below the top of your own
+# chord costs about what an octave leap in the line costs (_STEP is capped at
+# a twelfth of a semitone-leap each), so neither "always take the top note" nor
+# "never move" can win outright. Tilt _UNDER up and the reading becomes a
+# skyline; tilt it down and the line sinks into whatever inner voice moves
+# least, which on a strummed part is the root note going nowhere.
+_STEP = 0.12          # per semitone of melodic leap, capped at an octave
+_UNDER = 1.0          # per octave below the top of its own event
+_QUIET = 0.5          # for being the quiet one of that event
+_RESTART = 1.2        # seconds of silence after which the line starts afresh
+
+
+def split_melody(notes: list[Note]) -> tuple[list[Note], list[Note]]:
+    """Separate `notes` into the line being played and what is under it.
+
+    One note per event goes to the line, chosen so the line as a whole holds
+    together: a Viterbi over the events, paying for melodic leaps, for sitting
+    below the top of its own chord, and for being the quiet note in it. The
+    leap term is what does the real work - a strummed chord's top note and a
+    lick's next note are indistinguishable one event at a time, and only look
+    different as a path. Picking the highest note of every event instead (a
+    skyline) hops onto whichever chord tone happens to be on top and reads as
+    an arpeggio, which is the thing this exists to get out of the way.
+
+    A gap longer than `_RESTART` ends a phrase rather than being leapt across:
+    after a bar of rest the hand may be anywhere, and charging for the
+    interval would drag the next phrase towards the last one's register.
+    """
+    events = _group(notes)
+    if not events:
+        return [], []
+
+    def emission(n: Note, event: list[Note]) -> float:
+        return _UNDER * (event[-1].pitch - n.pitch) / 12.0 + _QUIET * (1.0 - n.velocity)
+
+    cost = [np.array([emission(n, events[0]) for n in events[0]])]
+    back: list[np.ndarray] = []
+    for prev, event in zip(events, events[1:]):
+        restart = event[0].start - max(n.end for n in prev) > _RESTART
+        step = np.array([[0.0 if restart else _STEP * min(abs(n.pitch - p.pitch), 12)
+                          for p in prev] for n in event])
+        m = cost[-1][None, :] + step
+        back.append(m.argmin(axis=1))
+        cost.append(m.min(axis=1) + np.array([emission(n, event) for n in event]))
+
+    path = [int(np.argmin(cost[-1]))]
+    for b in reversed(back):
+        path.append(int(b[path[-1]]))
+    path.reverse()
+
+    line = [event[k] for event, k in zip(events, path)]
+    chosen = {id(n) for n in line}
+    return line, [n for n in notes if id(n) not in chosen]
 
 
 def pick_instrument(notes: list[Note]) -> str:
@@ -120,58 +272,54 @@ def pick_instrument(notes: list[Note]) -> str:
 def fret_notes(notes: list[Note], instrument: str = "guitar") -> list[Fretted]:
     """Choose playable string/fret positions, minimising hand movement (Viterbi).
 
-    The state is (string, fret, hand position), not just (string, fret): a
-    guitarist keeps the hand in one four-fret box and crosses strings inside
+    The state is the hand position, not the individual note's (string, fret):
+    a guitarist keeps the hand in one four-fret box and crosses strings inside
     it, and only a state that remembers where the hand is can prefer that over
-    running the melody up a single string. Chords are anchored on their lowest
-    note; the rest of the voicing is placed on free strings near that hand.
+    running the melody up a single string.
+
+    Each event is placed *as a whole* against each candidate hand
+    (`_placement`), rather than by anchoring its lowest note and then finding
+    somewhere for the rest. Anchoring first is what produced the tab's worst
+    lie: B3 + E4 + G4 would take the open B and open e for the first two
+    notes, leaving G4 nothing under the hand but the twelfth fret of the G
+    string - while the shape a guitarist actually plays (G4/B5/e3, three
+    fingers in one box) was never considered, because the anchor had already
+    been committed. Placing the event jointly finds that shape, and the same
+    search is what lets a note be *left out* rather than printed at a fret
+    nobody would reach for.
     """
     tuning = TUNINGS[instrument]
-    groups = [g for g in _group(notes) if _candidates(g[0].pitch, tuning)]
+    groups = [[n for n in g if _candidates(n.pitch, tuning)] for g in _group(notes)]
+    groups = [g for g in groups if g]
     if not groups:
         return []
     hands = _hand_options(tuning)
-    open_pen = _open_penalty([n for g in groups for n in g], tuning)
+    open_pen = round(_open_penalty([n for g in groups for n in g], tuning), 2)
+    shapes = [[_placement(tuple(n.pitch for n in g), tuning, h, open_pen) for h in hands]
+              for g in groups]
 
-    # 1) dynamic program over the anchor (lowest) note of each event, with the
-    #    hand position carried in the state
-    states: list[list[tuple[int, int, int]]] = []
-    for g in groups:
-        cands = _candidates(g[0].pitch, tuning)
-        states.append([(s, f, h) for s, f in cands for h in hands
-                       if f == 0 or -1 <= f - h < BOX + 1])
+    # [to, from] - the same shift costs the same wherever in the song it is
+    shift = np.array([[_hand_cost(a, b) for a in hands] for b in hands])
+    lows = [np.array([low for _, low, _ in s]) for s in shapes]
 
-    cost = [np.array([_position_cost(f, h, open_pen) for _, f, h in states[0]])]
+    cost = [np.array([c for c, _, _ in shapes[0]])]
     back: list[np.ndarray] = []
     for i in range(1, len(groups)):
-        prev, cur = states[i - 1], states[i]
-        pc = cost[-1]
-        m = np.array([[pc[j] + _hand_cost(prev[j][2], h) + _string_cost(prev[j][0], s)
-                       for j in range(len(prev))]
-                      for s, f, h in cur])
+        cross = _string_cost(lows[i][:, None], lows[i - 1][None, :])
+        m = cost[-1][None, :] + shift + cross
         back.append(m.argmin(axis=1))
-        cost.append(m.min(axis=1)
-                    + np.array([_position_cost(f, h, open_pen) for _, f, h in cur]))
+        cost.append(m.min(axis=1) + np.array([c for c, _, _ in shapes[i]]))
 
     path = [int(np.argmin(cost[-1]))]
     for b in reversed(back):
         path.append(int(b[path[-1]]))
     path.reverse()
 
-    # 2) expand each event around its anchor
     out: list[Fretted] = []
-    for group, state_list, k in zip(groups, states, path):
-        s, f, hand = state_list[k]
-        used = {s}
-        out.append(Fretted(group[0], s, f))
-        for n in group[1:]:
-            free = [(cs, cf) for cs, cf in _candidates(n.pitch, tuning) if cs not in used]
-            if not free:
-                continue
-            cs, cf = min(free, key=lambda c: _position_cost(c[1], hand, open_pen)
-                                             + 0.5 * abs(c[0] - s))
-            used.add(cs)
-            out.append(Fretted(n, cs, cf))
+    for group, shape, k in zip(groups, shapes, path):
+        for n, s in zip(group, shape[k][2]):
+            if s is not None:
+                out.append(Fretted(n, s, n.pitch - tuning[s]))
     return out
 
 

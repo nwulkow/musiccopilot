@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { api, followJob, bytes } from '../api'
 import { chosenTranscriber, settings, useTranscribers } from '../composables/useSettings'
 import ImportPanel from '../components/ImportPanel.vue'
+import CapturePanel from '../components/CapturePanel.vue'
 
 const router = useRouter()
 const songs = ref([])
@@ -85,6 +86,17 @@ function onDrop(e) {
   if (file) upload(file)
 }
 
+/**
+ * A finished capture is a new library song, so it takes the upload's path
+ * exactly: list it, then analyse it. The recording itself already happened on
+ * the server, which is why there is no job to follow up to this point.
+ */
+async function onCaptured(out) {
+  await refresh()
+  const entry = songs.value.find((s) => s.id === out.song)
+  if (entry) analyze(entry)
+}
+
 /** An import job is keyed by the song id it is about to create, so it can be
  *  followed exactly like an analysis - the row appears once the import lands. */
 function onImport(job) {
@@ -116,6 +128,7 @@ const empty = computed(() => !loading.value && !songs.value.length)
         <p class="muted sub">Drop a song in, and Scriptum works out what it is made of.</p>
       </div>
       <div class="actions">
+        <CapturePanel @captured="onCaptured" @error="err = $event" />
         <ImportPanel @started="onImport" @error="err = $event" />
         <button class="btn btn-primary" @click="fileInput.click()">
           <span>＋</span> Add song

@@ -6,6 +6,7 @@
   python -m musiccopilot tab      song.mp3 --part "guitar solo"
   python -m musiccopilot tab      song.mp3 --stem guitar --start 1:02 --end 1:18
   python -m musiccopilot tab      song.mp3 --part "guitar solo" --follow
+  python -m musiccopilot capture  "Livin on a Prayer" --device blackhole
   python -m musiccopilot record   --instrument guitar
   python -m musiccopilot solo     song.mp3 --prompt "slow bluesy" --play
   python -m musiccopilot models
@@ -29,7 +30,8 @@ from . import chart, notes as nt, report, synth
 from .config import SR, TUNINGS, fretboard_for
 from .form import bar_edges, bar_start
 from .pipeline import Song
-from .tabs import StaffLayout, TabLayout, fret_notes, pick_instrument, render_tab
+from .tabs import (StaffLayout, TabLayout, fret_notes, pick_instrument,
+                   render_tab, split_melody)
 
 _BAR = re.compile(r"^(?:bars?\s*(\d+)|(\d+)\s*bars?)$")
 
@@ -182,7 +184,8 @@ def cmd_analyze(args) -> None:
     """Run the full pipeline (stems, chords, notes, lyrics, form) and write the chart."""
     song = Song.open(args.file).run(
         separate=not args.no_separate, do_lyrics=not args.no_lyrics,
-        do_notes=not args.no_notes, do_snippets=not args.no_snippets,
+        do_notes=not args.no_notes, do_snippets=args.snippets,
+        do_voices=not args.no_voices, voice_count=args.voices,
         llm=args.llm, force=args.force, backend=args.backend,
         whisper_size=args.whisper, device=args.device, log=report.log)
     if args.stem_snippets:
@@ -191,6 +194,40 @@ def cmd_analyze(args) -> None:
     report.console.print(f"[green]done[/] → everything in {song.work}")
     report.full(song)
     report.console.print(f"\nrecreate sheet → [bold]{path}[/]")
+
+
+def cmd_voices(args) -> None:
+    """Show, redo or undo the split of a stem that holds more than one player."""
+    song = _load(args.file, need_form=False)
+    if song.sources and not args.undo:
+        raise ValueError(f"{song.path.name} was imported, not separated - its "
+                         "stems are already one player each; correct a wrong "
+                         "row with `musiccopilot tracks --map` instead")
+
+    changed: set[str] = set()
+    if args.undo:
+        for source in list(song.voices):
+            changed |= song.merge_voices(source, log=report.log)
+        if not changed:
+            report.console.print("[dim]nothing was split[/]")
+    elif args.force or args.count or not song.voices:
+        # A count is a correction of an earlier answer, so it implies a redo -
+        # otherwise asking for three guitars on an already-split song would
+        # find the stem already accounted for and quietly do nothing.
+        changed = song.split_voices(stems=args.stem or None, count=args.count,
+                                    force=args.force or bool(args.count),
+                                    log=report.log)
+
+    if changed:
+        # The form reads which stem leads a solo, so it and everything cut
+        # from it are gone; this is what puts them back.
+        song = Song.open(song.path).run(backend=args.backend, log=report.log)
+        chart.write(song)
+        song = Song.open(song.path)
+    report.voices(song)
+    if not args.undo and not song.sources:
+        report.console.print("\n[dim]--count 3 to insist on three players, "
+                             "--undo to put them back together.[/]")
 
 
 def cmd_parts(args) -> None:
@@ -254,6 +291,28 @@ def _llm_clean(song, window: list, start: float, end: float) -> list:
     return out
 
 
+# The three readings of a window that holds more than one part at once. The
+# web layer offers the same three, from this list rather than its own copy.
+VOICE_READINGS = ("all", "melody", "backing")
+
+
+def _voice(window: list, voice: str) -> list:
+    """Keep one reading of a window that holds more than one part at once.
+
+    Display-time, like `_llm_clean`: both halves are notes the stem really
+    contains, so nothing is cached and `--voice all` is exactly what was there
+    before. `voices.py` is the other tool for this and answers a different
+    question - it splits a stem when two *people* played into it; this splits
+    a reading when one person played a line and a chord.
+    """
+    if voice not in VOICE_READINGS:
+        raise ValueError(f"unknown voice {voice!r}; have {', '.join(VOICE_READINGS)}")
+    if voice == "all" or not window:
+        return window
+    line, backing = split_melody(window)
+    return line if voice == "melody" else backing
+
+
 def cmd_tab(args) -> None:
     """Print (or play/follow) tablature for a part, a bar range or a time range."""
     song = _load(args.file)
@@ -267,6 +326,7 @@ def cmd_tab(args) -> None:
     window = nt.in_window(ns, start, end)
     if args.llm_clean:
         window = _llm_clean(song, window, start, end)
+    window = _voice(window, getattr(args, "voice", "all"))
     # A fretboard is a lie for a stem with no strings (piano, vocals, the
     # demucs catch-all "other"): `pick_instrument` would have quietly forced
     # bass or guitar tuning on it (`--stem piano` used to print a 4-string
@@ -287,8 +347,11 @@ def cmd_tab(args) -> None:
         layout = TabLayout(fret_notes(window, instrument), instrument, **common)
     else:
         layout = StaffLayout(window, **common)
+    voice = getattr(args, "voice", "all")
     heading = report.window_title(song, start, end,
                                   f"{title} · " if title else "") + f" · {args.stem}"
+    if voice != "all":
+        heading += f" · {voice}"
     if args.follow:
         if not fretted_stem and args.follow_view == "tab":
             report.console.print(f"[yellow]'{args.stem}' has no fretboard; "
@@ -416,6 +479,124 @@ def cmd_solo(args) -> None:
     report.solo(solo, tab, wav, midi)
     if args.play:
         synth.play(wav)
+
+
+def _input_device(name):
+    """An input device index from an index, a name, or part of one."""
+    import sounddevice as sd
+
+    if name in (None, ""):
+        return None
+    try:
+        return int(name)
+    except (TypeError, ValueError):
+        pass
+    low = str(name).lower()
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0 and low in d["name"].lower():
+            return i
+    raise SystemExit(f"no input device matching {name!r} - see "
+                     f"`python -m musiccopilot capture --list-devices`")
+
+
+def cmd_capture(args) -> None:
+    """Record an input device straight into the library as a song.
+
+    Separate from `record`, which is the live practice pane: that one folds to
+    mono and transcribes while you play, because it is showing you what you are
+    playing *now*. This one does nothing but capture - the point is a clean
+    stereo file for the offline pipeline, and a transcriber competing for the
+    CPU is how a take gets a hole in it.
+
+    The device is usually a loopback driver (BlackHole, Loopback), which is how
+    a song you can only stream becomes a file the pipeline can read. It records
+    at the device's own sample rate rather than resampling on the way in;
+    `audio.load` resamples to `SR` when the pipeline reads the wav, so one
+    conversion happens instead of two.
+    """
+    import sounddevice as sd
+
+    from . import audio, record
+    from .daw import slug
+
+    if args.list_devices:
+        report.console.print("[dim]input devices:[/]")
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_input_channels"] > 0:
+                loop = "  [dim](loopback - use this for streamed audio)[/]" \
+                    if "blackhole" in d["name"].lower() or "loopback" in d["name"].lower() else ""
+                report.console.print(
+                    f"  [bold]{i}[/]  {d['name']}  [dim]{d['max_input_channels']}ch "
+                    f"@ {d['default_samplerate']:.0f} Hz[/]{loop}")
+        return
+
+    device = _input_device(args.device)
+    info = sd.query_devices(device, "input")
+    sr = int(args.sr or info["default_samplerate"])
+    channels = 1 if args.mono else min(2, int(info["max_input_channels"]))
+
+    rec = record.Recorder(sr, channels=channels, device=device,
+                          max_seconds=args.max_minutes * 60)
+    stop_at = args.seconds or 0.0
+    report.console.print(
+        f"[dim]capturing from [/][bold]{info['name']}[/][dim] - {sr} Hz, "
+        f"{'stereo' if channels == 2 else 'mono'}, "
+        + (f"stopping after {stop_at:.0f}s" if stop_at else "ctrl-c to stop") + "[/]")
+    report.console.print("[dim]start playback now.[/]")
+
+    try:
+        with rec:
+            while not (stop_at and rec.seconds >= stop_at):
+                time.sleep(0.25)
+                db = 20 * np.log10(max(rec.peak, 1e-7))
+                bars = int(max(0.0, min(24.0, (db + 60.0) / 2.5)))
+                report.console.print(
+                    f"  [dim]{rec.seconds:6.1f}s[/]  {db:6.1f} dB  "
+                    f"[green]{'|' * bars}[/]{' ' * (24 - bars)}", end="\r")
+    except KeyboardInterrupt:
+        pass
+    report.console.print(" " * 60, end="\r")
+
+    y = rec.frames()
+    if not y.size:
+        report.console.print("[yellow]nothing captured[/]")
+        return
+
+    root = Path(args.out).expanduser().resolve() if args.out else Path.cwd()
+    root.mkdir(parents=True, exist_ok=True)
+    name = slug(args.name or time.strftime("capture-%Y%m%d-%H%M%S"))
+    path, n = root / f"{name}.wav", 1
+    while path.exists():                    # never overwrite an earlier take
+        n += 1
+        path = root / f"{name}-{n}.wav"
+    audio.save(path, y, sr)
+
+    peak = float(np.abs(y).max())
+    report.console.print(
+        f"[green]captured[/] {rec.seconds:.1f}s -> {path.name} "
+        f"[dim](peak {20 * np.log10(max(peak, 1e-7)):.1f} dB)[/]")
+    if rec.overflows:
+        report.console.print(f"[yellow]{rec.overflows} dropout(s)[/] - the machine "
+                             f"could not keep up; close something and redo the take")
+
+    # Silence is the failure this setup actually has, and it has one cause: the
+    # audio went into the loopback device and nowhere else, or not into it at
+    # all. Saying so beats leaving someone to analyse four minutes of nothing.
+    if peak < 1e-3:
+        report.console.print(
+            "[yellow]that is silence.[/] Check that the song was playing, and that "
+            "macOS is outputting to a [bold]Multi-Output Device[/] containing both "
+            "BlackHole and your speakers - sending output to BlackHole alone is "
+            "silent, sending it to the speakers alone is not captured.")
+        return
+
+    if args.analyze:
+        song = Song.open(path).run(backend=args.backend, log=report.log)
+        chart.write(song)
+        report.full(song)
+    else:
+        report.console.print(f"now run: [bold]python -m musiccopilot analyze "
+                             f"{path.name}[/], or open it in Scriptum")
 
 
 def cmd_record(args) -> None:
@@ -618,8 +799,9 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--no-separate", action="store_true")
     a.add_argument("--no-lyrics", action="store_true")
     a.add_argument("--no-notes", action="store_true")
-    a.add_argument("--no-snippets", action="store_true",
-                   help="skip cutting each part out as a wav")
+    a.add_argument("--snippets", action="store_true",
+                   help="also cut each part out as a wav (off by default - "
+                        "storage; `musiccopilot snippets` does this on demand)")
     a.add_argument("--llm", action="store_true", help="ask Gemini to listen to the track")
     a.add_argument("--force", action="store_true", help="ignore cache")
     a.add_argument("--whisper", default="base", help="tiny|base|small|medium|large-v3")
@@ -629,7 +811,29 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--backend", default=None, choices=list(nt.BACKENDS),
                    help=f"note transcriber (default {nt.DEFAULT_BACKEND}); "
                         "see `musiccopilot transcribers`")
+    a.add_argument("--no-voices", action="store_true",
+                   help="do not look for a second guitarist inside the guitar stem")
+    a.add_argument("--voices", type=int, default=None, metavar="N",
+                   help="insist the guitar stem holds N players instead of letting "
+                        "the split decide")
     a.set_defaults(func=cmd_analyze)
+
+    v = sub.add_parser("voices", help="players found inside one separated stem",
+                       description="Separation gives one `guitar` file however many "
+                                   "guitarists played. This shows how that stem was "
+                                   "split into `guitar`, `guitar-2` ... - or why it "
+                                   "was not - and redoes the split on demand.")
+    v.add_argument("file")
+    v.add_argument("--stem", action="append", default=[],
+                   help="which instrument to look inside (repeatable; default guitar)")
+    v.add_argument("--count", type=int, default=None, metavar="N",
+                   help="insist on N players rather than letting the split decide")
+    v.add_argument("--force", action="store_true", help="redo an existing split")
+    v.add_argument("--undo", action="store_true",
+                   help="sum the players back into the one stem they came from")
+    v.add_argument("--backend", default=None, choices=list(nt.BACKENDS),
+                   help="note transcriber for the re-read afterwards")
+    v.set_defaults(func=cmd_voices)
 
     tr = sub.add_parser("transcribe", help="re-read the notes with another engine")
     tr.add_argument("file")
@@ -677,6 +881,9 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--start", default=None, help="seconds, mm:ss, or bar N")
     t.add_argument("--end", default=None, help="seconds, mm:ss, or bar N")
     t.add_argument("--subdiv", type=int, default=4, help="grid steps per beat")
+    t.add_argument("--voice", default="all", choices=list(VOICE_READINGS),
+                   help="one stem can hold a riff and a strummed chord at once; "
+                        "'melody' reads out the line, 'backing' what is under it")
     t.add_argument("--llm-clean", action="store_true",
                    help="ask Gemini to declutter the transcription (merge jittered/"
                         "duplicate notes, drop spurious ones) before rendering the tab")
@@ -711,6 +918,33 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--subdiv", type=int, default=4)
     g.add_argument("--play", action="store_true")
     g.set_defaults(func=cmd_solo)
+
+    cap = sub.add_parser("capture", help="record an input device into the library",
+                         description="Record whatever an input device is hearing "
+                                     "and file it as a song. With a loopback driver "
+                                     "(BlackHole, Loopback) as the device, this is "
+                                     "how a song you can only stream becomes a file "
+                                     "the pipeline can read.")
+    cap.add_argument("name", nargs="?", default=None,
+                     help="what to call the song (default: a timestamp)")
+    cap.add_argument("--device", default=None,
+                     help="input device name or index, e.g. --device blackhole")
+    cap.add_argument("--list-devices", action="store_true",
+                     help="print the input devices and exit")
+    cap.add_argument("--seconds", type=float, default=0.0,
+                     help="stop after this many seconds (default: on ctrl-c)")
+    cap.add_argument("--max-minutes", type=float, default=12.0,
+                     help="how much audio to make room for (default 12)")
+    cap.add_argument("--sr", type=int, default=0,
+                     help="sample rate (default: whatever the device runs at)")
+    cap.add_argument("--mono", action="store_true", help="capture one channel")
+    cap.add_argument("--out", default=None,
+                     help="library folder to write into (default: here)")
+    cap.add_argument("--analyze", action="store_true",
+                     help="run the analysis as soon as the capture stops")
+    cap.add_argument("--backend", default=None, choices=list(nt.BACKENDS),
+                    help="note transcriber for --analyze")
+    cap.set_defaults(func=cmd_capture)
 
     r = sub.add_parser("record", help="play into the mic: live notes, tabs and chords")
     r.add_argument("--name", default=None, help="folder name for the take")

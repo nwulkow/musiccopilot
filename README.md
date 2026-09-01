@@ -359,7 +359,7 @@ Everything lands in `analyzed_songs/<song>/`, next to the audio file:
 | `snippets/03_chorus-1/guitar.wav` | ...per instrument, with `--stem-snippets` |
 | `analysis.json` | tempo, beats, key, chord track, raw segmentation |
 | `stems/*.wav` | drums, bass, other, vocals, guitar, piano |
-| `notes/*.json` | transcribed notes per stem |
+| `notes/*.json` | transcribed notes per stem, checked against the audio |
 | `lyrics.json` | Whisper transcript of the vocal stem |
 
 Every stage is cached separately, so nothing is ever computed twice. To redo one
@@ -380,8 +380,9 @@ completely — same songs, same ids, same results.
 | patterns | `analysis.py` | repeated n-chord loop mining, riff-density windows |
 | chart | `chart.py` | one chord loop per role, plus only what differs in each repeat |
 | notes | `notes.py` | pick one: Basic Pitch (polyphonic, default), CREPE (mono, keeps bends), pYIN (mono, lightest) |
+| checking | `clean.py` | CQT of the stem: drop notes with no energy of their own, and overtones of notes underneath them |
 | lyrics | `lyrics.py` | Whisper on the isolated vocal stem |
-| tabs | `tabs.py` | Viterbi over fret positions minimising hand travel |
+| tabs | `tabs.py` | Viterbi over hand positions, each chord placed as a whole shape |
 | score | `score.py` | note values, rests, ties, spelling against the key; VexFlow draws it |
 | solos | `gemini.py` | Gemini structured JSON output → notes → tab + MIDI + audio |
 | sound | `synth.py` | additive osc on a pitch curve (bends/slides/vibrato) + amp sim |
@@ -415,6 +416,18 @@ grid the browser draws is computed in Python and only positioned in JavaScript.
 
 ## Tuning the results
 
+- Notes that are not there? Every transcription is now checked against the
+  audio it describes before it is cached: a note whose own pitch band never
+  rises out of the stem's noise floor is dropped, a stem that is nothing but
+  separation residue (the piano in a song with no piano) gets no notes at all,
+  and a "note" that is only the octave or twelfth of a chord already sounding
+  underneath it is dropped as the overtone it is. Thresholds are `CLEAN` in
+  `config.py`. If a real quiet part is going missing, loosen `note_floor_db`;
+  if a stem you did play is being called residue, loosen `presence_db`. Either
+  change needs the notes re-read — bump `clean.REVISION` or pass `--force`.
+- A riff buried under chords? `--voice melody` (Scriptum sends the same
+  `voice=` parameter) reads the line out of a stem that holds more than one
+  part. It is display-only and changes nothing on disk.
 - Notes wrong? Try another transcriber. **Basic Pitch** (the default) hears
   chords, so it is right for rhythm parts and wrong for a solo, where it
   invents extra pitches and chops a bend into steps. **CREPE** tracks one
@@ -426,7 +439,8 @@ grid the browser draws is computed in Python and only positioned in JavaScript.
 - Form off? The knobs are in `FORM` in `config.py` - `min_bars`, `k_range`
   (how many kinds of material to look for), `vocal_threshold`, `solo_density`.
 - Chords sound smeared? `detect_chords(..., self_prob=0.7)` for faster changes.
-- Tabs in the wrong position? adjust `_position_cost` / `_move_cost` in `tabs.py`.
+- Tabs in the wrong position? adjust `_position_cost` / `_hand_cost` / `_LOW_BIAS`
+  in `tabs.py`; `_LOW_BIAS` is what settles a tie towards the nut.
 - Solo too tame? `--temperature 1.4`, or be far more specific in `--prompt`.
 - `GEMINI_MODEL=gemini-2.5-flash` for cheaper/faster solo drafts. Run
   `python -m musiccopilot models` to see what your key can reach — if a Gemini 3
@@ -514,6 +528,10 @@ python -m musiccopilot tab song.mp3 --stem guitar --bars 17-24
 # staff instead of a fretboard - clef is picked automatically from the notes
 python -m musiccopilot tab song.mp3 --stem piano --bars 17-24   # staff, not frets
 
+# one stem often holds a riff and a strummed chord at once. --voice melody
+# reads the line out of it; --voice backing shows what is under it
+python -m musiccopilot tab song.mp3 --part verse --stem guitar --voice melody
+
 # tidy a transcribed passage up with Gemini before printing it (display only -
 # it never overwrites the transcription, and it is capped to a passage)
 python -m musiccopilot tab song.mp3 --part "guitar solo" --stem guitar --llm-clean
@@ -524,6 +542,12 @@ python -m musiccopilot tab song.mp3 --part "guitar solo" --stem guitar --llm-cle
 python -m musiccopilot tab song.mp3 --part "guitar solo" --stem guitar --follow
 python -m musiccopilot tab song.mp3 --stem guitar --bars 17-24 \
     --follow --minus-stem --speed 0.75 --count-in 4
+
+# separation gives one "guitar" file however many guitarists played. this is
+# who is actually in it — usually settled during analyze, correctable here
+python -m musiccopilot voices song.mp3
+python -m musiccopilot voices song.mp3 --count 2   # insist on two of them
+python -m musiccopilot voices song.mp3 --undo      # ...or on one
 
 # which note transcriber this install can run, and re-read one song's notes
 # with a different one (cheap: stems, chords and form are left alone)

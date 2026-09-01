@@ -12,6 +12,7 @@ import shutil
 import unicodedata
 from pathlib import Path
 
+from musiccopilot.audio import STEM_EXT
 from musiccopilot.config import workdir_for
 
 AUDIO_SUFFIXES = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus",
@@ -68,13 +69,21 @@ def stages(work: Path) -> dict:
     """Which pipeline stages are cached for a song - one flag per file the
     pipeline writes, which is exactly what the client shows as progress."""
     notes = work / "notes"
+    stem_dir = work / "stems"
+    has_stems = stem_dir.is_dir() and (any(stem_dir.glob("*.wav"))
+                                       or any(stem_dir.glob(f"*{STEM_EXT}")))
     return {
-        "stems": (work / "stems").is_dir() and any((work / "stems").glob("*.wav")),
+        "stems": has_stems,
         "analysis": (work / "analysis.json").exists(),
         "notes": notes.is_dir() and any(notes.glob("*.json")),
         "lyrics": (work / "lyrics.json").exists(),
         "form": (work / "form.json").exists(),
-        "snippets": (work / "snippets").is_dir() and any((work / "snippets").glob("*.wav")),
+        # A snippet is cut on demand from the form's own bounds (see
+        # `serialize`/`app.media_snippet`), not pre-rendered to disk any more
+        # - so "done" means the form exists, the same as the `form` flag.
+        # `musiccopilot snippets` can still write files for someone who wants
+        # them, which the badge does not try to reflect.
+        "snippets": (work / "form.json").exists(),
         "chart": (work / "chart.md").exists(),
         "llm_notes": (work / "llm_notes.txt").exists(),
     }

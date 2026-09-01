@@ -32,9 +32,14 @@ python -m musiccopilot show song.mp3 --what chords # read the cache
 python -m musiccopilot tab song.mp3 --part "guitar solo" --stem guitar --play
 python -m musiccopilot tab song.mp3 --stem guitar --start 1:02 --end 1:18 --audio
 python -m musiccopilot tab song.mp3 --part "guitar solo" --stem guitar --llm-clean
+python -m musiccopilot tab song.mp3 --part verse --stem guitar --voice melody
 python -m musiccopilot snippets song.mp3 --stems   # re-cut the per-part wavs
 python -m musiccopilot solo song.mp3 --prompt "slow bluesy" --play
 python -m musiccopilot models                      # Gemini models this key can reach
+
+python -m musiccopilot voices song.mp3             # who is playing the guitar stem
+python -m musiccopilot voices song.mp3 --count 2   # ...insist on two of them
+python -m musiccopilot voices song.mp3 --undo      # ...put them back into one stem
 
 python -m musiccopilot transcribers                # note engines this install can run
 python -m musiccopilot analyze song.mp3 --backend crepe
@@ -63,6 +68,11 @@ whatever `--part`/`--bars`/`--start`/`--end` selected - it never writes
 the flag. It is capped to a **snippet** (`LLM_CLEAN_MAX_NOTES` /
 `LLM_CLEAN_MAX_SECONDS`); see "What a Gemini button is allowed to cost".
 
+`--voice` picks one reading of a stem that holds more than one part at once —
+a riff and a strummed chord played by the same person into the same file.
+`melody` reads out the line, `backing` what is under it, `all` (the default) is
+everything. See "One stem, two parts, one reader".
+
 There is no test suite, linter config, or build step. To smoke-test a change, run against
 the checked-in `crystallize.mp3` — its stems, notes, lyrics and analysis are already in
 `analyzed_songs/crystallize/`, so a rerun only recomputes what you deleted. Deleting
@@ -88,6 +98,8 @@ computes only the missing stages. Each stage is independently cached:
 | `analysis.json` | tempo, beats, key, chords, structure |
 | `notes/<stem>.json` | per-stem note transcription (rewritten after `form.json` for solo stems) |
 | `note_backends.json` | which transcriber each stem's notes came from |
+| `notes_clean.json` | which revision of each note-shaping pass (`clean.py`, then `texture.py`) passed over them |
+| `voices.json` | which stems held more than one player — and which held one |
 | `lyrics.json` | Whisper on the vocal stem |
 | `form.json` | song form — needs notes + lyrics, so it runs after both |
 | `snippets/*.wav` | one audio excerpt per part (`--stems` also writes per-instrument) |
@@ -180,7 +192,20 @@ for slow ballads, lower it for fast changes.
   "early, and different words every time" and would otherwise take the verse slot outright —
   and since each family gets at most one role, the real verse then silently gets none.
 - Which stem is the `lead` on a solo is note density **weighted by how audible that stem
-  actually is** over the part, and by how much it moves around. Raw note counts are not
+  actually is** over the part, by how much it moves around, and by **whether it is
+  playing a line at all** (`FORM["lead_chord_penalty"]` over `texture.chordness`).
+  That last one is the same argument that keeps `bass` out of `LEAD_STEMS` — a
+  lead is one note at a time — and it only became measurable once `texture.py`
+  could say which notes were struck together. It matters most exactly where it
+  is newest: before a stem is split into players a solo's runner-up is a
+  near-silent piano and the margin is huge, but once `voices.py` has split one
+  guitar into a rhythm part and a lead, the runner-up *is* the rhythm guitar,
+  strumming all the way through the solo. Measured on waves-bon-jovi's split
+  solo the margin goes 1.45 (demoted to "Instrumental", losing the monophonic
+  re-transcription and every bend with it) to 2.35. It is not set higher than
+  0.6 because a piano lead genuinely does play chords and a line at once.
+  Note that the part is named for `base_stem(lead)`, so a split guitar's solo
+  is a "Guitar solo" and not a bare "Solo". Raw note counts are not
   usable on their own: the near-silent piano stem in crystallize (RMS 0.001, 40× below the
   guitar) had *more* Basic Pitch notes than the guitar playing the solo, because the model
   fires on the noise floor demucs leaves behind — that is how a guitar solo came to be
@@ -225,6 +250,186 @@ that mean "every guitar" call `audio.stems_of` first. Widening inside `mix` woul
 from. `backing` itself accepts either — an instrument drops every stem of it (what you want to
 solo over), one exact stem name drops only that one (what the second guitarist wants from
 `--minus-stem`).
+
+### One separated stem can hold several guitarists
+
+Separation gives exactly one `guitar` file however many guitarists played, so a
+band with a rhythm part, a lead and an acoustic gets all three summed into it —
+and one tab with three people's notes stacked on one fretboard, in one hand
+position, with the acoustic's open strings interleaved between the lead's bends.
+[voices.py](musiccopilot/voices.py) splits such a stem again into `guitar`,
+`guitar-2`, `guitar-3`, which the rest of the pipeline already knows how to read
+(above): a suffixed stem is its own wav, its own notes and its own tab while
+being a guitar for every lookup keyed by instrument. `Song.split_voices` runs it
+as a pipeline stage; `musiccopilot voices` and `POST /api/songs/{id}/voices` are
+the same call by hand.
+
+**The unit it clusters is the strum, not the note.** Six strings and one pick
+is one player, so the notes of a chord were all played by whoever played any of
+them — and a cue read off a single note does not know that. Measured against
+ground truth (a known power-chord part and a known lead line, summed and split
+back apart) clustering notes one at a time cut *the rhythm player* in half and
+handed the halves to two different stems, because the root, fifth and octave of
+one power chord differ in register and in everything register drags along with
+it. `texture.strums` says which notes those are (see "A strum is one event");
+each group is one row, one weight and one label, and every note in it inherits
+that label. The old `_chords` post-pass — a majority vote that pulled a chord
+back onto one player *after* the clustering had already split it — is gone,
+subsumed by doing it before.
+
+**And the fourth cue is what the player is doing.** Timbre, pan and register
+all describe an instrument; none of them describes a *part*, so two guitars
+through the same amp at the same pan were indistinguishable however chordal one
+was and however linear the other. `chordness` — 0 for a note struck alone, 0.5
+for one of a pair, 1 for one of three or more — is the cue that says which is
+the rhythm player, and `Voice.role` reports it in words ("chords" / "single
+notes"), which is the half of a description a reader recognises first.
+
+It is gated twice, because it is the most dangerous cue here:
+
+- **`_distinct` has to claim what it says.** The clause reads "one plays chords
+  where the other plays single notes", so one side must actually be at or above
+  `TEXTURE["rhythm_at"]` and the other at or below `["lead_at"]`. A *gap* is not
+  enough, and testing one was the mistake worth recording: a rhythm part whose
+  chords the tracker caught whole half the time and one note of the other half
+  splits into "all chords" and "some chords", which are 0.57 apart on this scale
+  and are the same guitarist. Gating on the gap claimed a third player in all
+  three two-player test mixes and cost 16 points of note accuracy in the panned
+  one (91.9 → 75.6).
+- **The two textures have to sound at the same time** (`_interleaved` against
+  `VOICES["min_interleave"]`). One guitarist who strums the verses and plays the
+  solo differs from *himself* in texture by more than two players usually do, so
+  without this the cue splits every song with a solo into a "rhythm player" and a
+  "lead player" who are one person — measured, on one rig, one pan, eight bars of
+  chords then eight of solo, it does exactly that. Two people differ from one
+  person doing two things in exactly one observable way: they can play at once.
+
+`_interleaved` **reads the notes, not the clusters**, and that is the whole
+point — the clustering is what is on trial, and when it is wrong it is wrong by
+scattering each player's notes through the other's half, which makes both look
+busy everywhere. The cluster-based version scored that one guitarist 73% "at
+once" for two parts with no overlap at all, and let the split through. It also
+reads the *quiet end* of the distribution rather than the average: both textures
+appear somewhere in almost any stem, because a strum the tracker half caught
+reads as single notes, so the measure is the 10th percentile of the smaller of
+the two shares across two-second windows — "in nine windows out of ten, both a
+chord part and a single-note part are audibly present". Measured 0.18/0.17/0.29
+on three two-player mixes against 0.00, 0.06 and 0.11 for one-guitarist stems and
+real single DI takes; the threshold sits in the middle of a thin margin, and it
+only ever *guards* the texture clause, since pan decides any mix that has some.
+
+**What this cost.** Two rhythm guitars playing the same texture are now harder
+to tell apart, because the strongest axis says they are the same thing. On a
+three-player mix (two rhythm guitars panned hard apart, a lead up the middle)
+the split finds one player where the note-level version found two of the three
+— and no weighting recovers it, because summing three parts compresses their
+measured pan to 0.31 apart when they were mixed 1.2 apart. `--count` is the
+override. Offering `_choose` both partitions per k — one clustered with
+texture, one on the instrument cues alone — and letting `_distinct` judge both
+was tried for this and made things worse, five of six right down to three: the
+pan-only proposal re-admits precisely the over-splits texture was suppressing,
+and the gate cannot tell one guitarist cut along a bleed-induced pan gap from a
+second guitarist. The partition is part of the evidence, not just a starting
+point for it. Against that, the four cases the note-level version got wrong — one
+rhythm and one lead panned apart, dead centre, and legato, plus the one-player
+false positives — now come out right: 2 of 6 correct before, 5 of 6 after, and
+note accuracy on the panned pair went 65.8% → 91.9%.
+
+**It clusters notes, not audio, and that is the whole design.** The obvious
+approach — decompose the stem with NMF and cluster the parts by how they sound —
+was built first and measured against ground truth (two known tracks summed,
+split, compared back). It reliably found two of *something* and just as reliably
+got them wrong, separating low notes from high ones or a guitar's fundamentals
+from its own upper partials, and scoring several dB **worse than not splitting at
+all**. The reason is structural: an NMF basis has no known pitch, so a timbre
+feature read off one is anchored on a guessed fundamental, and a wrong guess
+turns a timbre measurement into a pitch measurement. A *transcribed note* has a
+known pitch, so its harmonics can be read where they actually are. That single
+fact is why this stage runs after transcription rather than before — and it
+means the split produces the per-player note lists directly, so no stem is ever
+transcribed twice.
+
+Four cues, weighted unevenly on purpose (`VOICES` in
+[config.py](musiccopilot/config.py)). **Timbre** is the energy at each of a
+note's own harmonics — the only cue that survives both guitars playing the same
+riff in the same octave. **Pan** is the strongest single cue whenever it exists
+at all, because two rhythm guitars are nearly always spread left and right and
+demucs preserves the mix's stereo image. **Register** is weighted low: it is
+real, but one guitarist who plays a low riff and then a high solo would be split
+in two if it led. **Texture** is `chordness`, described above: the only cue that
+tells a rhythm part from a lead line, and the only one that is about the *part*
+rather than the instrument, which is why it is the one with two gates on it.
+Measured against ground truth, the shipped ratio places 92% of notes with the
+right player when the two are panned (93% when the lead is legato) and 75% dead
+centre, where texture is the only thing separating them at all — the note-level
+version did not split that mix at all.
+
+None of the four is standardised to its own spread, which is deliberate:
+standardising would make a cue carrying *no* information as loud as one carrying
+all of it, and weighting pan fully on a centred mix took note accuracy from 84%
+down to 60%. A cue that is not there should contribute nothing, and in natural
+units it does.
+
+**`_detrend` is load-bearing.** Reading harmonics relative to a note's own
+fundamental is *supposed* to make timbre pitch-invariant and is not enough on its
+own: on a single DI take the envelope still drifted with register hard enough
+that one guitarist split into a "warm low player" and a "bright high player" more
+convincingly (brightness gap 0.39) than two real guitars split apart (0.20). So
+the fitted pitch-dependence is regressed out across the whole stem and only the
+residual is clustered. The quadratic term matters — the relationship bends, and a
+straight line leaves enough curvature behind to cluster on.
+
+**Deciding *not* to split is the normal outcome, and cluster separation cannot
+be what decides it.** Across five single-instrument stems and four two-player
+mixes, silhouette scores ran 0.22–0.43 on *both*: one guitar cut in half scores
+as convincingly as two guitars do. What separates them is *which cue* the halves differ on, which is what
+`_distinct` gates on — an audible gap in placement; or one of them playing
+chords while the other plays single notes, when the stem holds both at once;
+or, with no pan to go on, a large gap in tone that also beats pitch at
+explaining the split. The last clause is what rejects the DI take, and the
+texture one carries its own guard for the same reason (above). The tone-only
+path is the marginal one (0.185 accepted against 0.177 rejected in the
+calibration set); pan is where the accuracy is, and a spurious `guitar-2` costs
+a real tab and buys a tab of leakage.
+
+**The audio follows the notes, and it is the weaker half.** Once each note has a
+player, the stem is masked by that player's harmonics — pitch-informed
+separation. The masks are normalised against each other so they **sum to one**,
+which makes the split a partition: `guitar + guitar-2` is sample-for-sample the
+file they came from. That is why splitting does not invalidate `analysis.json` —
+`harmonic_bed` sums to exactly what it summed to before — and why
+`merge_voices` can undo it exactly rather than approximately. Measured, the
+audio gains +2 to +3.5 dB SDR when the players are panned and roughly nothing
+when they are centred, so the notes (which are what the tabs are made of) are the
+deliverable and the audio is a bonus.
+
+What a split *does* invalidate is the form: which stem leads a solo is a
+different question once there are two guitars to choose between, so
+`_forget_form` drops `form.json`, `chart.md` and `snippets/`.
+
+**It reads the stem again rather than reading back what a later stage wrote.**
+`_refine_lead_notes` splices a monophonic transcription over each solo, which
+honestly reports far fewer notes there — so clustering the cached notes weights a
+solo at a tenth of its real size, and the same stem asked twice came back as two
+guitarists once and three the next time depending only on whether the song had
+been analysed before. It is the solo-notes feedback trap one stage along, and the
+fix is the same: re-transcribe the source before clustering it. That re-read is
+**not** written back unless the stem was also merged first — writing it over a
+refined cache would replace the monophonic solo with a polyphonic read and take
+every bend in the tab with it, silently, because a stem that turns out to hold
+one player changes nothing else that would notice.
+
+**An imported multitrack is never touched.** Its stems are the band's own
+tracks, one player each by construction; looking for a second guitarist inside
+one guitarist's DI take can only invent one. A wrong row there is a labelling
+mistake, and `daw.reassign` is what fixes it.
+
+`--undo` (and the Put back together button) is **sticky**: it leaves a
+one-player record in `voices.json` rather than no record, so the next analysis
+does not helpfully split the stem straight back apart. A correction the next run
+silently reverses is not a correction. `--force`/`--count` is that same undo
+followed immediately by a fresh look, so it clears the record first
+(`merge_voices(remember=False)`).
 
 ### Importing a DAW multitrack skips separation entirely
 
@@ -391,6 +596,147 @@ demucs and basic-pitch, so the two requirements have no overlapping version.
 An Omnizart entry could only ever be a permanently dead row in the settings
 pane. Do not add one back without checking that both constraints have moved.
 
+### A transcription is checked against the audio before it is cached
+
+Every tracker in `notes.py` answers "what pitch is most likely here?" and none
+of them answers "is anything here at all?". [clean.py](musiccopilot/clean.py)
+asks the second question, from one CQT of the stem, and it only ever *removes*
+notes — everything it knows is evidence that something is not there, and
+nothing it knows is evidence about what should have been there instead.
+
+**The measurement that makes it possible.** Across this repo's material, notes
+read off a stem the band actually played sit about 10 dB under that stem's own
+loud level; notes read off a stem separation merely produced — the piano in a
+song with no piano — sit **50 to 60 dB** under it, because they come from the
+noise floor. That gap is enormous and a pitch tracker cannot see any of it.
+`CLEAN["note_floor_db"]` (−35) is set inside it: crystallize's fake piano stem
+goes from 1112 notes to 54, waves-bon-jovi's from 1336 to 151, while real stems
+lose 3–8%.
+
+**"Is this instrument in the song" is a question about the *set* of stems**, and
+cannot be answered from one of them — a stem holding only residue is perfectly
+self-consistent, and the own-floor threshold above is measured against a floor
+that is all there is. So `clean.absent` compares each stem's loud level with the
+loudest stem in the song (`presence_db`, −25): on the solo-piano test file that
+is what correctly writes *no notes at all* for `vocals`, `other` and `bass`
+rather than a page of them. An imported multitrack is exempt, for the same
+reason `voices.py` never looks inside one: those stems are the band's own
+tracks, and a quiet one is a quiet player.
+
+**Two passes need the audio for reasons that are not about level.**
+
+- `_merge_repeats`. A polyphonic model splits one held note wherever its own
+  activation dips — 509 of crystallize's 1438 guitar notes start the instant
+  another at the same pitch ended. Which of those were re-picked and which were
+  one note *cannot be settled from the note list*: both look identical there.
+  It can be settled from the audio, because **a struck string gets louder**. So
+  a junction is merged only when the pitch's own band does not rise across it
+  (`attack_db`), which is what keeps a driving eighth-note strum reading as
+  eight notes rather than one long one. Merging on the gap alone was tried and
+  ate a third of the guitar stem.
+- `_drop_overtones`. A struck chord puts real energy an octave, a twelfth and
+  two octaves above each note in it, and a polyphonic model transcribes some of
+  those as notes; they are the ones that surface as a lone `e15` over a low
+  chord shape. Level alone cannot find them — a partial of a loud note is
+  louder than the whole of a quiet one — so the test is the **ratio**. Measured
+  on isolated notes here, a guitar's octave partial sits ~10 dB under its
+  fundamental and its twelfth ~17 (`overtone_rolloff`). A note no stronger than
+  that over a note already sounding underneath it has not been shown to exist
+  separately. Notes leave the candidate pool as they fail, so a partial cannot
+  go on to justify the partial above it.
+
+**`notes_clean.json` is what makes it a setting rather than a one-off**, exactly
+as `note_backends.json` is for the engine: the notes stage is cached per stem,
+so without a record of which revision checked `notes/guitar.json`, improving the
+checking would only ever reach songs nobody had analysed yet.
+`clean.REVISION` is compared on load and a mismatch is a cache miss — bump it
+when a pass changes what it keeps. Unlike the backend record there is nothing
+sensible to backfill a missing entry with, so a pre-existing cache is simply
+re-read once. It lives at the work root for the same reason
+`note_backends.json` does: `notes/` is globbed by stem name.
+
+**The solo splice is deliberately not checked.** `_refine_lead_notes` runs
+after this and replaces the solo window with a monophonic CREPE read, whose
+gates are already relative to that clip (see below) and whose window is by
+definition one where the lead is playing. Re-checking it against the whole
+stem's loud level would argue away the quiet end of a solo.
+
+### A strum is one event, and that is what a chord is made of
+
+Every tracker in `notes.py` emits one note at a time and none of them ever
+says which notes were *struck together*. That single missing fact is behind
+both of the ways a guitar tab here used to read as something nobody played,
+and [texture.py](musiccopilot/texture.py) recovers it once for both.
+
+**Printed, an ungrouped strum is an arpeggio.** `tabs` puts a note in the
+column its onset falls in, and a separated stem delivers a strum smeared over
+58ms at the median and 151ms at the 90th percentile (a real multitrack's
+rhythm track: 17ms and 66ms) - one to two sixteenth columns at any ordinary
+tempo. So one strummed chord came out as a cascade down the staff. `align`
+pulls each group onto the earliest of its onsets: the moment the pick reached
+the first string, which is the beat the player counted and the only one of
+them that is not late. Ends are left alone - a chord whose bass note rings
+under a damped top is real, and the tab reads onsets.
+
+**Clustered, an ungrouped strum is split between players.** Six strings and
+one pick is one player, so a chord's notes were all played by whoever played
+any of them - and a cue read off a single note does not know that. See "One
+separated stem can hold several guitarists".
+
+**What makes a strum.** Two stages: cluster in time, then cut the cluster into
+the voicings inside it.
+
+- `link` is the pick crossing one string to the next; `span` is how long the
+  whole stroke may take. **The chained one is load-bearing.** A window anchored
+  on the first note cannot tell a chord from a fast run at all - a sixteenth
+  at 120bpm is 125ms, inside any window wide enough to catch a smeared strum -
+  while a strum's *successive* onsets are pick-travel apart whatever the tempo.
+  Measured on a legato solo over a strummed part, an anchored 120ms window
+  welded 4% of the solo's notes into chords that were never played; chained at
+  60ms it welds none. `link` is calibrated on real DI takes rather than on a
+  synthetic strum, which is faster than anyone plays: 0.06 finds chords in 54%
+  of a rhythm take's events against 49% at 0.04, leaves a lead take at 5%, and
+  is the last value before a legato solo starts to fuse.
+- **No two adjacent pitches in the cluster may be more than `max_gap` apart**,
+  or it is cut there. Not a fitted threshold but a fact about guitars: a
+  voicing sits on adjacent strings, so its sorted pitches are 3-7 semitones
+  apart. Across all 236 intervals in `OPEN_CHORDS` and `MOVABLE_SHAPES` the
+  widest gap any shape has is 11 (the one `maj7` with a muted string) and 99%
+  are 8 or under, so an octave is wider than every chord this repo can print.
+  A wider gap means a chord and *something else sounding over it*.
+
+Cutting the cluster afterwards, rather than testing each note as it joins, is
+what makes the grouping independent of the order notes arrive in: a note an
+octave and a half over a bare fifth looks unreachable until the third note of
+the chord turns up in between.
+
+**Ground truth.** A known power-chord part and a known lead line, rendered
+separately, summed, transcribed, and every transcribed note traced back to the
+part it came from - panned apart, dead centre, and a fast legato solo ringing
+into itself. The measure is the *ceiling* the grouping puts on any later
+attempt to separate the two players. Simultaneity alone caps it at 78%,
+because a fifth of the groups already hold both; the octave cut lifts that to
+95-99% while still finding a chord in about half of all events.
+
+Two tests were built, measured and dropped: requiring a group's notes to *ring
+together* changed nothing (a legato line overlaps exactly as a chord does),
+and asking `tabs._placement` whether one hand could hold the group bought
+nothing at all - 79.2% against 79.2% - because the open low E and open high e
+are two octaves apart and perfectly reachable, so "one hand could play it" is
+not "one hand did".
+
+**It is deliberately not part of `clean.py`.** That module's whole contract is
+that it only ever *removes*, because everything it knows is evidence that
+something is not there. This one only ever *moves*, on evidence that is
+musical rather than acoustic. They run one after the other -
+`pipeline._shaped` is the pair - and stay separate modules for that reason.
+`notes_clean.json` records both revisions as `[clean, texture]`, and a
+mismatch in either is a cache miss exactly as a different backend is; a bare
+int is what the file held before `texture` existed and reads back as
+`[n, 0]`. `align` is idempotent by construction (a second run finds the same
+groups, already flush), so re-running it over notes that have been through it
+changes nothing.
+
 ### Solos are re-transcribed monophonically
 
 Basic Pitch is polyphonic, which is the wrong model for a solo: on one string playing one
@@ -427,6 +773,9 @@ So when re-running the form after touching anything in `notes.py`, delete
 a part that was a solo before is the signature of this, not evidence that the
 transcription change was bad.
 
+`voices.split_voices` is caught by the same trap for the same reason and works
+around it the same way — see "One separated stem can hold several guitarists".
+
 ### Live audio (play-along and recording)
 
 Both live features need `sounddevice`; everything else still imports without it.
@@ -458,22 +807,81 @@ what tells a bend from two notes — so what is saved beats what was displayed.
 / `_crepe_notes_from_audio` take an array, and both end in `_segment_contour`.
 A take you played and a stem on disk must not segment differently.
 
+### One stem, two parts, one reader
+
+`voices.py` splits a stem when two *people* played into it. `tabs.split_melody`
+(`tab --voice`, `?voice=` on `/api/songs/{id}/tab` and `/score`) answers the
+question that is left when they did not: one guitarist plays a riff and strums
+a chord, and the tab of the verse is both at once on the same six strings, with
+the line you were trying to learn somewhere inside it.
+
+It chooses one note per event by Viterbi, paying for melodic leaps, for sitting
+below the top of its own chord, and for being the quiet note in it. **The leap
+term is what does the real work.** A strummed chord's top note and a lick's next
+note are indistinguishable one event at a time and only look different as a
+path; taking the highest note of every event instead (a skyline) hops onto
+whichever chord tone happens to be on top and reads as an arpeggio, which is the
+thing this exists to get out of the way. The weights are balanced against each
+other on purpose — an octave below the top of your own chord costs about what an
+octave leap in the line costs — so neither "always take the top note" nor "never
+move" can win outright.
+
+It is **display-time and changes no cache**, like `--llm-clean`: both halves are
+notes the stem really contains, so this is a reading and not a finding. `all` is
+byte-for-byte what the tab was before the option existed. `cli._voice` is the
+one implementation and `scriptum/app.py` calls it, for the same reason
+`app._window` calls `cli._window`: which notes "melody" means must not differ
+between the browser and the terminal.
+
 ### Fretboard placement is position-aware
 
-`tabs.fret_notes`' Viterbi state is `(string, fret, hand position)`, not just
-`(string, fret)`. A guitarist keeps the left hand in a four-fret box (`BOX`) and
-crosses strings inside it; costing each note only against the previous one
-misses that, because every pitch is reachable somewhere on the high E string,
-so a purely local optimiser walks the melody up that one string and climbs the
-neck. That is what put crystallize's solo at frets 0–3 on the high E when it is
-actually played at 5–9 on the B string, and why it looked like it drifted sharp
-in the second half.
+`tabs.fret_notes`' Viterbi state is the **hand position**, not the individual
+note's `(string, fret)`. A guitarist keeps the left hand in a four-fret box
+(`BOX`) and crosses strings inside it; costing each note only against the
+previous one misses that, because every pitch is reachable somewhere on the
+high E string, so a purely local optimiser walks the melody up that one string
+and climbs the neck. That is what put crystallize's solo at frets 0–3 on the
+high E when it is actually played at 5–9 on the B string, and why it looked
+like it drifted sharp in the second half.
+
+**Each event is placed as a whole against each candidate hand** (`_placement`,
+a bitmask DP over which strings are still free, memoised because a song plays
+the same chord in the same position over and over). It used to anchor the
+event's lowest note and then find somewhere for the rest, and that is what
+produced the tab's worst lie: B3 + E4 + G4 took the open B and open e for the
+first two notes, leaving G4 nothing under the hand but the **twelfth fret of
+the G string** — while the shape a guitarist actually plays (G4 / B5 / e3,
+three fingers in one box) was never considered, because the anchor had already
+been committed. Placing an event jointly cannot strand its own later notes.
+
+The same search is what lets a note be **left out** (`_DROP_COST`) rather than
+printed at a fret nobody would reach for. It is offered only to a note in a
+*chord*, and that restriction is the whole safety of it: a chord can have more
+notes than the hand has strings (a phantom partial stacked on a six-note strum
+leaves nothing free but the far end of the neck), while a single note always
+has somewhere to go, and hiding one because the hand happens to be elsewhere
+would silently delete the highest note of a phrase. Whether a lone high note is
+real is `clean.py`'s question, not the fretboard's.
 
 `_open_penalty` is the other half. Open strings are the cheapest thing on the
 neck, so on a short window they win by default even for a lead line at the
 fifth fret. The penalty scales with the melody's own **10th-percentile** pitch —
 a line that dips to an open string once still lives up the neck — which is what
 keeps a two-bar window fretting the same way as the whole solo.
+
+**Low positions win ties (`_LOW_BIAS`), and the tie is the common case.**
+Everything under the hand costs about the same (0.02 a fret across the box), so
+the open shape of a strummed chord and a barre seven frets up come out within a
+hundredth of each other — and `_hand_cost` then makes that accidental choice
+permanent, because coming back down a fifth costs 4.5 and no per-event saving
+of 0.02 repays it. One event that genuinely wants a high hand dragged the rest
+of the passage with it: crystallize's verse went up to the seventh at bar 33
+and printed the open `E5` it is built on as a five-string barre for the rest of
+the part. A bias of 0.02 per fret settles the tie towards the nut and is far too
+small to move a real solo, which costs several points down at the nut. The
+open-string term in `_position_cost` is bounded (`min(hand, BOX)`) for the same
+reason — letting go of the box is no harder from the twelfth fret than from the
+fifth, and unbounded it charged an open voicing more than a barre.
 
 Bass is unaffected: its notes sit near its open strings, so the penalty is ~0
 and open-position basslines still print as open position.
@@ -657,6 +1065,21 @@ The web renderer draws columns at a **uniform** width where the ASCII one sizes
 each to its widest cell. That is a deliberate divergence: on screen it makes
 the x axis proportional to time, so spacing reads as rhythm. `layout["text"]`
 still carries the exact ASCII rendering for copy/paste.
+
+**The vocal line gets the words as well as the notes.** A vocals tab is a row
+of note names, which tells a singer the melody and nothing about what they are
+singing — so `LyricStrip.vue` puts the transcribed lines under it, reading
+`cursorTime` off the same shared transport as `TabGrid` and `ScoreSheet` so the
+words cannot drift from the notes above them. The current line stays lit until
+the *next* one starts rather than going out when it ends: Whisper's segments
+have gaps between them (a breath, an instrumental bar) and a highlight that
+blanks in those gaps reads as having lost your place at exactly the moment you
+look down to find it. Timing is per line, because per line is all Whisper gives.
+
+It is offered for the stem literally called `vocals` and not for anything whose
+`base_stem` is vocals: `pipeline.run` transcribes lyrics from that one stem, so
+a backing vocal imported as `vocals-2` sings different words and has none of its
+own. Showing the lead's words under it would be a confident lie.
 
 **Play-along runs on one clock.** `useTransport` owns a single `<audio>`
 element and every visible tab reads its `currentTime`; several instruments can

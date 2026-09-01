@@ -261,6 +261,43 @@ def score_json(score, *, title: str = "", stem: str = "",
     }
 
 
+def voices_json(voices: dict) -> dict:
+    """Which stems held more than one player, and what each of them is.
+
+    The description is built here rather than in the browser because it is a
+    reading of the measurement, not a formatting of it - "bright, panned left"
+    is `Voice.tone` and `Voice.placement`, and those thresholds belong beside
+    the numbers they judge. Stems that were checked and left alone are
+    included with their reason: "one guitarist" is a finding, and a player
+    looking at a tab that is obviously two guitars deserves to see that the
+    question was asked.
+    """
+    def voice(v, measured: bool) -> dict:
+        """One player. A stem that was *not* split has one voice standing for
+        the whole thing, and its cues were never measured - `voices.split`
+        returns before it gets that far. Reporting the dataclass defaults
+        would put "mid-toned, centred, E2-E4" on a stem nobody looked at that
+        closely, so they are left out rather than made up."""
+        row = {"stem": v.stem, "notes": v.notes, "share": v.share}
+        if measured:
+            row |= {"pan": v.pan, "brightness": v.brightness, "tone": v.tone,
+                    "placement": v.placement, "low": v.low, "high": v.high,
+                    # What the player is *doing* - chords or single notes -
+                    # which is the half of the description someone reading a
+                    # tab recognises first.
+                    "role": v.role, "describe": v.describe()}
+        return row
+
+    return {
+        source: {
+            "parts": split.parts,
+            "split": split.split,
+            "reason": split.reason,
+            "voices": [voice(v, split.split) for v in split.voices],
+        } for source, split in sorted(voices.items())
+    }
+
+
 def session_json(session) -> dict:
     """A DAW session on its way in: every track, and what it will become.
 

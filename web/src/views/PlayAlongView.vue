@@ -9,9 +9,10 @@
  */
 import { inject, ref, computed, watch, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { api, stemMeta, mmss } from '../api'
+import { api, stemMeta, voiceNote, mmss } from '../api'
 import TabGrid from '../components/TabGrid.vue'
 import ScoreSheet from '../components/ScoreSheet.vue'
+import LyricStrip from '../components/LyricStrip.vue'
 import { useTransport } from '../composables/useTransport'
 
 const props = defineProps({ id: { type: String, required: true } })
@@ -36,6 +37,22 @@ const analysis = computed(() => song.value?.analysis)
 const part = computed(() => parts.value.find((p) => p.name === partName.value) || null)
 const region = computed(() =>
   part.value ? { start: part.value.start, end: part.value.end } : null)
+
+/**
+ * The words for the passage on screen.
+ *
+ * They belong to the vocal stem specifically, not to any stem whose name
+ * starts with "vocals": `pipeline.run` transcribes lyrics from the stem
+ * literally called `vocals`, so a backing vocal separated out as `vocals-2`
+ * sings different words and has none of its own. Showing the lead's words
+ * under it would be a confident lie.
+ */
+const lyrics = computed(() => {
+  const all = song.value?.lyrics || []
+  if (!region.value) return all
+  return all.filter((l) => l.end > region.value.start && l.start < region.value.end)
+})
+const singable = (s) => s === 'vocals' && lyrics.value.length > 0
 
 /** Sheet music is scaled off the same slider that sets the tab's column width,
  *  so one "zoom" control means one thing on screen whatever is being read. */
@@ -225,6 +242,7 @@ const barNow = computed(() => {
             v-for="s in stems" :key="s"
             class="btn btn-sm stembtn" :class="{ active: picked.includes(s) }"
             :style="{ '--c': stemMeta(s).color }"
+            :title="voiceNote(song, s)"
             @click="toggleStem(s)"
           >{{ stemMeta(s).label }}</button>
         </div>
@@ -268,6 +286,9 @@ const barNow = computed(() => {
       >
         <header class="shead">
           <h3 class="sh">{{ stemMeta(s).label }}</h3>
+          <!-- Two guitars out of one stem look identical in a list of stems;
+               what tells them apart is how they sound and where they sit. -->
+          <span v-if="voiceNote(song, s)" class="vnote">{{ voiceNote(song, s) }}</span>
           <div class="sright">
             <span v-if="minusMine.includes(s)" class="chip chip-red">muted — your part</span>
             <div class="seg">
@@ -287,6 +308,13 @@ const barNow = computed(() => {
             </div>
           </div>
         </header>
+
+        <!-- what to sing, on the same clock as what to play -->
+        <LyricStrip
+          v-if="singable(s)"
+          :lines="lyrics" :cursor-time="pos" follow
+          @seek="transport.seek($event)"
+        />
 
         <ScoreSheet
           v-if="layouts[s] && viewOf(s) === 'sheet'"
@@ -316,7 +344,9 @@ const barNow = computed(() => {
           >{{ n.name }}</span>
         </div>
 
-        <div v-else class="dim pad">No notes for this stem in this passage.</div>
+        <div v-else-if="!singable(s)" class="dim pad">
+          No notes for this stem in this passage.
+        </div>
       </section>
     </div>
 
@@ -370,6 +400,7 @@ const barNow = computed(() => {
 .sheet { padding: 12px 15px 8px; border-left: 3px solid var(--c); }
 .shead { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
 .sh { font-family: var(--font-display); font-size: 16px; color: var(--c); }
+.vnote { font-size: 11.5px; color: var(--text-4); margin-right: auto; }
 .sright { display: flex; align-items: center; gap: 7px; }
 .seg { display: flex; gap: 3px; }
 

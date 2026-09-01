@@ -34,6 +34,15 @@ const qs = (params) => {
 export const api = {
   health: () => req('/api/health'),
   devices: () => req('/api/devices'),
+
+  // Recording an input device into the library. Server-side, like the live
+  // panes: the mic and the loopback driver both belong to the machine
+  // Scriptum runs on. The meter is polled rather than streamed because a
+  // level is a gauge, not a transcript - a client that reconnects wants the
+  // current value, not every value since the take started.
+  captureStatus: () => req('/api/capture'),
+  captureStart: (body) => post('/api/capture/start', body),
+  captureStop: (body = {}) => post('/api/capture/stop', body),
   transcribers: () => req('/api/transcribers'),
 
   library: () => req('/api/library'),
@@ -116,6 +125,10 @@ export const api = {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   }),
+  // Splitting the guitar stem into the guitarists inside it - or putting
+  // them back. Like a re-transcription it is a job, because it re-reads the
+  // stem and the form is worked out again afterwards.
+  voices: (id, body = {}) => post(`/api/songs/${encodeURIComponent(id)}/voices`, body),
   chart: (id) => req(`/api/songs/${encodeURIComponent(id)}/chart`),
   chords: (id) => req(`/api/songs/${encodeURIComponent(id)}/chords`),
   tab: (id, params) => req(`/api/songs/${encodeURIComponent(id)}/tab${qs(params)}`),
@@ -138,7 +151,7 @@ export const api = {
   media: {
     mix: (id) => `/api/songs/${encodeURIComponent(id)}/media/mix`,
     stem: (id, stem) => `/api/songs/${encodeURIComponent(id)}/media/stem/${stem}`,
-    snippet: (id, name) => `/api/songs/${encodeURIComponent(id)}/media/snippet/${name}`,
+    snippet: (id, slug) => `/api/songs/${encodeURIComponent(id)}/media/snippet/${slug}`,
     file: (id, name) => `/api/songs/${encodeURIComponent(id)}/media/file/${name}`,
     backing: (id, exclude) =>
       `/api/songs/${encodeURIComponent(id)}/media/backing${qs({ exclude })}`,
@@ -208,6 +221,26 @@ export const STEM_META = {
  * sheet music. The number stays in the label, because two buttons both
  * saying "Guitar" is no better.
  */
+/**
+ * What a split stem's player is, in words - or '' for an ordinary stem.
+ *
+ * Separation gives one `guitar` file however many guitarists played, so
+ * `voices.py` splits it again into `guitar` and `guitar-2`. In a list of stems
+ * those two look like nothing but a numbering; what actually tells them apart
+ * is that one is bright and panned left and the other is warm and centred.
+ * The wording is the server's (`serialize.voices_json` reads it off
+ * `Voice.tone`/`Voice.placement`), because it is a judgement about the
+ * measurement rather than a formatting of it.
+ */
+export const voiceNote = (song, stem) => {
+  for (const split of Object.values(song?.voices || {})) {
+    if (!split.split) continue
+    const v = (split.voices || []).find((v) => v.stem === stem)
+    if (v) return v.describe
+  }
+  return ''
+}
+
 const STEM_SUFFIX = /-(\d+)$/
 
 export const stemMeta = (s) => {

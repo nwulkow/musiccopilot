@@ -10,3 +10,5 @@ analyzed_songs/*
 web/node_modules/
 web/dist/
 recordings/
+*.wav
+*.mp3

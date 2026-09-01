@@ -8,7 +8,7 @@ from rich.table import Table
 
 from . import notes as nt
 from .analysis import common_progressions, find_riffs
-from .config import fretboard_for
+from .config import fretboard_for, pitch_name
 from .form import bar_edges, bar_index, reference_part
 from .tabs import chord_chart, pick_instrument, scale_notes, tab_for
 
@@ -140,6 +140,35 @@ def instruments(song) -> None:
     console.print(t)
 
 
+def voices(song) -> None:
+    """Print which stems held more than one player, and what each one is.
+
+    Stems that were looked at and left alone are printed too, with the reason.
+    "One guitarist" is a finding, and a player looking at a tab that is
+    obviously two guitars deserves to see that the question was asked.
+    """
+    if not song.voices:
+        console.print("[dim]no stem has been checked for more than one player yet[/]")
+        return
+    for source, split in sorted(song.voices.items()):
+        if not split.split:
+            console.print(f"[bold]{source}[/] - one player [dim]({split.reason})[/]")
+            continue
+        console.print(f"[bold]{source}[/] -> {', '.join(split.parts)} "
+                      f"[dim]({split.reason})[/]")
+        t = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+        # "plays" comes first: which one is the rhythm player is the thing a
+        # reader is looking for, and it identifies a part in a way "bright,
+        # panned left" does not.
+        for c in ("stem", "plays", "tone", "placement", "range", "notes", "share"):
+            t.add_column(c)
+        for v in split.voices:
+            t.add_row(v.stem, v.role or "-", v.tone, v.placement,
+                      f"{pitch_name(v.low)}-{pitch_name(v.high)}",
+                      str(v.notes), f"{round(v.share * 100)}%")
+        console.print(t)
+
+
 def riffs(song, stem: str = "guitar", count: int = 3) -> None:
     """Auto-detect the busiest passages of a stem and print them as tab."""
     ns = song.notes.get(stem)
@@ -176,6 +205,11 @@ def full(song) -> None:
     chords(song)
     patterns(song)
     instruments(song)
+    # Only when a stem actually turned out to hold more than one player. "One
+    # guitarist" is worth printing when it was asked for (`musiccopilot
+    # voices`) and noise in a report about everything else.
+    if any(sp.split for sp in song.voices.values()):
+        voices(song)
     lead = "guitar" if "guitar" in song.notes else next(iter(song.notes), None)
     if lead:
         riffs(song, lead)
